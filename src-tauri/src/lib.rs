@@ -30,6 +30,12 @@ struct AppState {
     monitor_stats: Arc<Mutex<MonitorStats>>,
 }
 
+// Holds references to tray menu items we may want to update dynamically
+#[derive(Clone)]
+struct TrayState {
+    monitor_item: tauri::menu::MenuItem<tauri::Wry>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct DatabaseInfo {
     id: String,
@@ -38,6 +44,7 @@ struct DatabaseInfo {
     size_human: String,
     mode: String,
     stats: DatabaseStatsInfo,
+    indicator_counts: IndicatorCounts,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -49,6 +56,14 @@ struct DatabaseStatsInfo {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+struct IndicatorCounts {
+    total: usize,
+    ip: usize,
+    literal: usize,
+    glob: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Hit {
     id: String,
     timestamp: String,
@@ -56,6 +71,7 @@ struct Hit {
     match_type: String,
     source: String, // "manual" or "log"
     database_id: String,
+    matched_indicators: Vec<String>, // Pattern IDs or "IP: <cidr>" for IP matches
     data: Vec<serde_json::Value>,
 }
 
@@ -92,6 +108,12 @@ fn load_database(path: String, state: tauri::State<'_, AppState>) -> Result<Data
             let stats = db.stats();
             let mode = format!("{:?}", db.mode());
             
+            // Get indicator counts
+            let ip_count = db.ip_count();
+            let literal_count = db.literal_count();
+            let glob_count = db.glob_count();
+            let total_count = ip_count + literal_count + glob_count;
+            
             // Generate unique ID
             let id = format!("{}", uuid::Uuid::new_v4());
             
@@ -113,6 +135,12 @@ fn load_database(path: String, state: tauri::State<'_, AppState>) -> Result<Data
                     queries_with_match: stats.queries_with_match,
                     cache_hit_rate: stats.cache_hit_rate(),
                     match_rate: stats.match_rate(),
+                },
+                indicator_counts: IndicatorCounts {
+                    total: total_count,
+                    ip: ip_count,
+                    literal: literal_count,
+                    glob: glob_count,
                 },
             };
             
@@ -140,6 +168,12 @@ fn list_databases(state: tauri::State<'_, AppState>) -> Result<Vec<DatabaseInfo>
         let stats = db.stats();
         let mode = format!("{:?}", db.mode());
         
+        // Get indicator counts
+        let ip_count = db.ip_count();
+        let literal_count = db.literal_count();
+        let glob_count = db.glob_count();
+        let total_count = ip_count + literal_count + glob_count;
+        
         result.push(DatabaseInfo {
             id: entry.id.clone(),
             path: entry.path.clone(),
@@ -151,6 +185,12 @@ fn list_databases(state: tauri::State<'_, AppState>) -> Result<Vec<DatabaseInfo>
                 queries_with_match: stats.queries_with_match,
                 cache_hit_rate: stats.cache_hit_rate(),
                 match_rate: stats.match_rate(),
+            },
+            indicator_counts: IndicatorCounts {
+                total: total_count,
+                ip: ip_count,
+                literal: literal_count,
+                glob: glob_count,
             },
         });
     }
@@ -182,21 +222,28 @@ fn query_databases(query: String, state: tauri::State<'_, AppState>, app: tauri:
     for entry in databases.values() {
         let db = entry.db.lock().unwrap();
         if let Ok(Some(result)) = db.lookup(&query) {
-            let data_values: Vec<serde_json::Value> = match result {
-                MatchyQueryResult::Ip { data, .. } => {
-                    vec![serde_json::to_value(&data).unwrap_or(serde_json::Value::Null)]
+            let (data_values, matched_indicators): (Vec<serde_json::Value>, Vec<String>) = match result {
+                MatchyQueryResult::Ip { data, prefix_len } => {
+                    let indicator = format!("{}/{}", query, prefix_len);
+                    (vec![serde_json::to_value(&data).unwrap_or(serde_json::Value::Null)], vec![indicator])
                 }
-                MatchyQueryResult::Pattern { data, .. } => {
-                    data.iter()
+                MatchyQueryResult::Pattern { data, pattern_ids } => {
+                    let indicators: Vec<String> = pattern_ids
+                        .iter()
+                        .filter_map(|id| db.get_pattern_string(*id))
+                        .collect();
+                    let values = data.iter()
                         .filter_map(|opt_dv| {
                             opt_dv.as_ref().and_then(|dv| serde_json::to_value(dv).ok())
                         })
-                        .collect()
+                        .collect();
+                    (values, indicators)
                 }
                 MatchyQueryResult::NotFound => continue,
             };
             
-            if !data_values.is_empty() {
+            // Show hit if we have indicators (even without data)
+            if !matched_indicators.is_empty() {
                 let hit = Hit {
                     id: Uuid::new_v4().to_string(),
                     timestamp: Utc::now().to_rfc3339(),
@@ -204,6 +251,7 @@ fn query_databases(query: String, state: tauri::State<'_, AppState>, app: tauri:
                     match_type: "Manual".to_string(),
                     source: "manual".to_string(),
                     database_id: entry.id.clone(),
+                    matched_indicators,
                     data: data_values,
                 };
                 
@@ -221,7 +269,7 @@ fn query_databases(query: String, state: tauri::State<'_, AppState>, app: tauri:
 }
 
 #[tauri::command]
-fn set_monitoring(enabled: bool, state: tauri::State<'_, AppState>) -> Result<MonitorStatus, String> {
+fn set_monitoring(enabled: bool, state: tauri::State<'_, AppState>, app: tauri::AppHandle) -> Result<MonitorStatus, String> {
     *state.inner().monitoring_enabled.lock().unwrap() = enabled;
     let db_count = state.inner().databases.lock().unwrap().len();
     
@@ -229,6 +277,9 @@ fn set_monitoring(enabled: bool, state: tauri::State<'_, AppState>) -> Result<Mo
     if enabled {
         *state.inner().monitor_stats.lock().unwrap() = MonitorStats::default();
     }
+
+    // Update tray menu label if available
+    update_tray_monitor_label(&app, enabled);
     
     let stats = state.inner().monitor_stats.lock().unwrap();
     Ok(MonitorStatus {
@@ -271,21 +322,33 @@ fn process_log_line(line: &str, databases: &HashMap<String, DatabaseEntry>, extr
         for entry in databases.values() {
             let db = entry.db.lock().unwrap();
             if let Ok(Some(result)) = db.lookup(&query_str) {
-                let data_values: Vec<serde_json::Value> = match result {
-                    MatchyQueryResult::Ip { data, .. } => {
-                        vec![serde_json::to_value(&data).unwrap_or(serde_json::Value::Null)]
+                let (data_values, matched_indicators): (Vec<serde_json::Value>, Vec<String>) = match result {
+                    MatchyQueryResult::Ip { data, prefix_len } => {
+                        let indicator = format!("{}/{}", query_str, prefix_len);
+                        (vec![serde_json::to_value(&data).unwrap_or(serde_json::Value::Null)], vec![indicator])
                     }
-                    MatchyQueryResult::Pattern { data, .. } => {
-                        data.iter()
+                    MatchyQueryResult::Pattern { data, pattern_ids } => {
+                        eprintln!("[DEBUG] Pattern match for '{}': pattern_ids = {:?}, data.len() = {}", 
+                                 query_str, pattern_ids, data.len());
+                        let indicators: Vec<String> = pattern_ids
+                            .iter()
+                            .filter_map(|id| db.get_pattern_string(*id))
+                            .collect();
+                        let values = data.iter()
                             .filter_map(|opt_dv| {
                                 opt_dv.as_ref().and_then(|dv| serde_json::to_value(dv).ok())
                             })
-                            .collect()
+                            .collect();
+                        (values, indicators)
                     }
                     MatchyQueryResult::NotFound => continue,
                 };
                 
-                if !data_values.is_empty() {
+                eprintln!("[DEBUG] After match: matched_indicators = {:?}, data_values.len() = {}",
+                         matched_indicators, data_values.len());
+                
+                // Show hit if we have indicators (even without data)
+                if !matched_indicators.is_empty() {
                     hits.push(Hit {
                         id: Uuid::new_v4().to_string(),
                         timestamp: Utc::now().to_rfc3339(),
@@ -293,6 +356,7 @@ fn process_log_line(line: &str, databases: &HashMap<String, DatabaseEntry>, extr
                         match_type: match_type.to_string(),
                         source: "log".to_string(),
                         database_id: entry.id.clone(),
+                        matched_indicators,
                         data: data_values,
                     });
                 }
@@ -339,6 +403,9 @@ fn start_log_monitoring(app: tauri::AppHandle, state: Arc<Mutex<HashMap<String, 
             let stdout = child.stdout.take().unwrap();
             let reader = BufReader::new(stdout);
             
+            let mut last_stats_update = std::time::Instant::now();
+            const STATS_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+            
             for line in reader.lines() {
                 if !*monitoring.lock().unwrap() {
                     let _ = child.kill();
@@ -363,13 +430,25 @@ fn start_log_monitoring(app: tauri::AppHandle, state: Arc<Mutex<HashMap<String, 
                     }
                     
                     for hit in hits {
+                        eprintln!("[DEBUG] Found hit: {} (type: {}, indicators: {:?})", 
+                                 hit.matched_text, hit.match_type, hit.matched_indicators);
+                        
                         // Send notification
                         if let Err(e) = send_hit_notification(&app, &hit) {
                             eprintln!("Failed to send notification: {}", e);
                         }
                         
                         // Emit to frontend
-                        let _ = app.emit("hit", hit);
+                        match app.emit("hit", &hit) {
+                            Ok(_) => eprintln!("[DEBUG] Successfully emitted hit to frontend"),
+                            Err(e) => eprintln!("[DEBUG] Failed to emit hit: {}", e),
+                        }
+                    }
+                    
+                    // Periodically emit database stats update (every second)
+                    if last_stats_update.elapsed() >= STATS_UPDATE_INTERVAL {
+                        let _ = app.emit("databases-updated", ());
+                        last_stats_update = std::time::Instant::now();
                     }
                 }
             }
@@ -452,8 +531,11 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     use tauri::menu::{MenuBuilder, MenuItemBuilder};
     
     let show_item = MenuItemBuilder::with_id("show", "Show Window").build(app)?;
-    let monitor_item = MenuItemBuilder::with_id("monitor", "Enable Monitoring").build(app)?;
+let monitor_item = MenuItemBuilder::with_id("monitor", "Start Monitoring").build(app)?;
     let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+    
+    // Store the monitor menu item so we can update the label later
+    app.manage(TrayState { monitor_item: monitor_item.clone() });
     
     let menu = MenuBuilder::new(app)
         .item(&show_item)
@@ -477,6 +559,9 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(state) = app.try_state::<AppState>() {
                         let mut enabled = state.inner().monitoring_enabled.lock().unwrap();
                         *enabled = !*enabled;
+
+                        // Update tray label
+                        update_tray_monitor_label(app, *enabled);
                         
                         // Emit event to frontend
                         if let Some(window) = app.get_webview_window("main") {
@@ -493,4 +578,11 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .build(app)?;
     
     Ok(())
+}
+
+fn update_tray_monitor_label(app: &tauri::AppHandle, enabled: bool) {
+    if let Some(tray_state) = app.try_state::<TrayState>() {
+let text = if enabled { "Stop Monitoring" } else { "Start Monitoring" };
+        let _ = tray_state.monitor_item.set_text(text);
+    }
 }

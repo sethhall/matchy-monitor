@@ -10,6 +10,12 @@ extern "C" {
     
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "event"])]
     async fn listen(event: &str, handler: &JsValue) -> JsValue;
+    
+    #[wasm_bindgen(js_namespace = console)]
+    fn log(s: &str);
+    
+    #[wasm_bindgen(js_namespace = console)]
+    fn error(s: &str);
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -20,6 +26,7 @@ struct DatabaseInfo {
     size_human: String,
     mode: String,
     stats: DatabaseStatsInfo,
+    indicator_counts: IndicatorCounts,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -31,6 +38,14 @@ struct DatabaseStatsInfo {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct IndicatorCounts {
+    total: usize,
+    ip: usize,
+    literal: usize,
+    glob: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Hit {
     id: String,
     timestamp: String,
@@ -38,6 +53,7 @@ struct Hit {
     match_type: String,
     source: String,
     database_id: String,
+    matched_indicators: Vec<String>,
     data: Vec<serde_json::Value>,
 }
 
@@ -88,15 +104,27 @@ pub fn App() -> impl IntoView {
     Effect::new(move |_| {
         spawn_local(async move {
             let closure = Closure::wrap(Box::new(move |event: JsValue| {
-                if let Ok(hit) = serde_wasm_bindgen::from_value::<Hit>(
-                    js_sys::Reflect::get(&event, &"payload".into()).unwrap()
-                ) {
-                    set_hits.update(|hits| {
-                        hits.insert(0, hit);
-                        if hits.len() > 100 {
-                            hits.truncate(100);
+                log("Received hit event");
+                match js_sys::Reflect::get(&event, &"payload".into()) {
+                    Ok(payload) => {
+                        match serde_wasm_bindgen::from_value::<Hit>(payload) {
+                            Ok(hit) => {
+                                log(&format!("Parsed hit: {:?}", hit));
+                                set_hits.update(|hits| {
+                                    hits.insert(0, hit);
+                                    if hits.len() > 100 {
+                                        hits.truncate(100);
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                error(&format!("Failed to parse hit: {:?}", e));
+                            }
                         }
-                    });
+                    }
+                    Err(e) => {
+                        error(&format!("Failed to get payload: {:?}", e));
+                    }
                 }
             }) as Box<dyn FnMut(JsValue)>);
             
@@ -119,6 +147,36 @@ pub fn App() -> impl IntoView {
             }) as Box<dyn FnMut(JsValue)>);
             
             let _ = listen("databases-updated", closure.as_ref()).await;
+            closure.forget();
+        });
+    });
+    
+    // Listen for monitoring state changes from tray
+    Effect::new(move |_| {
+        spawn_local(async move {
+            let closure = Closure::wrap(Box::new(move |event: JsValue| {
+                log("Received monitoring-changed event");
+                match js_sys::Reflect::get(&event, &"payload".into()) {
+                    Ok(payload) => {
+                        if let Ok(enabled) = serde_wasm_bindgen::from_value::<bool>(payload) {
+                            log(&format!("Monitoring changed to: {}", enabled));
+                            set_monitoring.set(enabled);
+                            // Refresh monitor stats
+                            spawn_local(async move {
+                                let res = invoke("get_monitor_status", JsValue::NULL).await;
+                                if let Ok(status) = serde_wasm_bindgen::from_value::<MonitorStatus>(res) {
+                                    set_monitor_stats.set(status);
+                                }
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        error(&format!("Failed to get monitoring-changed payload: {:?}", e));
+                    }
+                }
+            }) as Box<dyn FnMut(JsValue)>);
+            
+            let _ = listen("monitoring-changed", closure.as_ref()).await;
             closure.forget();
         });
     });
@@ -283,15 +341,11 @@ pub fn App() -> impl IntoView {
                         view! { <></> }.into_any()
                     }
                 }}
-                
-                <div style="margin-left: auto; color: #6b7280; font-size: 0.8125rem; font-weight: 500;">
-                    {move || status.get()}
-                </div>
             </div>
             
             <div style="display: flex; flex: 1; overflow: hidden;">
                 // Sidebar - Database List
-                <div style="width: 300px; background: #f9fafb; border-right: 1px solid #e5e7eb; overflow-y: auto; padding: 1.25rem;">
+                <div style="width: 240px; background: #f9fafb; border-right: 1px solid #e5e7eb; overflow-y: auto; padding: 1rem;">
                     <h2 style="margin: 0 0 1rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.8px; color: #6b7280; font-weight: 700;">
                         "Databases"
                     </h2>
@@ -332,12 +386,24 @@ pub fn App() -> impl IntoView {
                                                         "×"
                                                     </button>
                                                 </div>
-                                                <div style="color: #6b7280; font-size: 0.75rem; margin-bottom: 0.375rem;">
+                                                <div style="color: #6b7280; font-size: 0.75rem; margin-bottom: 0.5rem;">
                                                     {db.size_human.clone()}
                                                 </div>
-                                                <div style="display: flex; align-items: center; gap: 0.5rem; color: #6b7280; font-size: 0.75rem;">
-                                                    <span>{format!("{} queries", db.stats.total_queries)}</span>
-                                                    <span style="color: #d1d5db;">"·"</span>
+                                                
+                                                // Indicator counts section
+                                                <div style="color: #6b7280; font-size: 0.75rem; margin-bottom: 0.5rem;">
+                                                    <span style="font-weight: 600; color: #111827;">{format!("{}", db.indicator_counts.total)}</span>
+                                                    <span>" indicators"</span>
+                                                </div>
+                                                
+                                                <div style="color: #6b7280; font-size: 0.75rem; margin-bottom: 0.25rem;">
+                                                    {format!("{} queries", db.stats.total_queries)}
+                                                </div>
+                                                <div style="color: #6b7280; font-size: 0.75rem; margin-bottom: 0.25rem;">
+                                                    {format!("{} hits", db.stats.queries_with_match)}
+                                                </div>
+                                                <div style="display: flex; align-items: center; gap: 0.375rem; color: #6b7280; font-size: 0.75rem;">
+                                                    <span>"Match rate:"</span>
                                                     <span style="color: #3b82f6; font-weight: 600;">{format!("{:.1}%", db.stats.match_rate * 100.0)}</span>
                                                 </div>
                                             </div>
@@ -418,6 +484,26 @@ fn HitCard(hit: Hit) -> impl IntoView {
                     {source}
                 </span>
             </div>
+            
+            // Display matched indicators
+            {if !hit.matched_indicators.is_empty() {
+                view! {
+                    <div style="display: flex; align-items: start; gap: 0.5rem; margin-bottom: 0.875rem;">
+                        <span style="font-size: 0.75rem; color: #6b7280; font-weight: 500; flex-shrink: 0;">"Matched:"</span>
+                        <div style="display: flex; flex-wrap: wrap; gap: 0.375rem;">
+                            {hit.matched_indicators.iter().map(|indicator| {
+                                view! {
+                                    <span style="padding: 0.125rem 0.5rem; background: #fef3c7; color: #92400e; border-radius: 4px; font-size: 0.6875rem; font-weight: 600; font-family: 'SF Mono', 'Monaco', monospace;">
+                                        {indicator.clone()}
+                                    </span>
+                                }
+                            }).collect::<Vec<_>>()}
+                        </div>
+                    </div>
+                }.into_any()
+            } else {
+                view! { <></> }.into_any()
+            }}
             
             // Display data fields
             <div style="background: #f9fafb; padding: 0.875rem; border-radius: 8px; font-size: 0.8125rem; border: 1px solid #f3f4f6;">

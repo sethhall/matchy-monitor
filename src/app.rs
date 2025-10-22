@@ -1,12 +1,13 @@
 use leptos::task::spawn_local;
+use web_sys;
 use leptos::{ev::SubmitEvent, prelude::*};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
 extern "C" {
-    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"])]
-    async fn invoke(cmd: &str, args: JsValue) -> JsValue;
+    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], catch)]
+    async fn invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
     
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "event"])]
     async fn listen(event: &str, handler: &JsValue) -> JsValue;
@@ -18,6 +19,66 @@ extern "C" {
     fn error(s: &str);
 }
 
+// Helper functions for localStorage
+fn get_local_storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok()?
+}
+
+fn load_collapse_state(key: &str, default: bool) -> bool {
+    let result = get_local_storage()
+        .and_then(|storage| storage.get_item(key).ok()?)
+        .and_then(|value| {
+            log(&format!("Loading state for {}: {:?}", key, value));
+            value.parse::<bool>().ok()
+        })
+        .unwrap_or_else(|| {
+            log(&format!("Using default for {}: {}", key, default));
+            default
+        });
+    log(&format!("Final state for {}: {}", key, result));
+    result
+}
+
+fn save_collapse_state(key: &str, value: bool) {
+    if let Some(storage) = get_local_storage() {
+        match storage.set_item(key, &value.to_string()) {
+            Ok(_) => log(&format!("Saved state for {}: {}", key, value)),
+            Err(e) => error(&format!("Failed to save state for {}: {:?}", key, e)),
+        }
+    } else {
+        error(&format!("localStorage not available for {}", key));
+    }
+}
+
+fn load_hits_from_storage() -> Vec<Hit> {
+    get_local_storage()
+        .and_then(|storage| storage.get_item("hits").ok()?)
+        .and_then(|json| {
+            log(&format!("Loading hits from storage: {} bytes", json.len()));
+            serde_json::from_str(&json).ok()
+        })
+        .unwrap_or_else(|| {
+            log("No hits found in storage, starting fresh");
+            Vec::new()
+        })
+}
+
+fn save_hits_to_storage(hits: &[Hit]) {
+    if let Some(storage) = get_local_storage() {
+        match serde_json::to_string(hits) {
+            Ok(json) => {
+                match storage.set_item("hits", &json) {
+                    Ok(_) => log(&format!("Saved {} hits to storage", hits.len())),
+                    Err(e) => error(&format!("Failed to save hits to storage: {:?}", e)),
+                }
+            }
+            Err(e) => error(&format!("Failed to serialize hits: {:?}", e)),
+        }
+    } else {
+        error("localStorage not available for hits");
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DatabaseInfo {
     id: String,
@@ -27,6 +88,8 @@ struct DatabaseInfo {
     mode: String,
     stats: DatabaseStatsInfo,
     indicator_counts: IndicatorCounts,
+    description: Option<String>,
+    build_epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -55,47 +118,101 @@ struct Hit {
     database_id: String,
     matched_indicators: Vec<String>,
     data: Vec<serde_json::Value>,
+    log_line: Option<String>,
+}
+
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ExtractedValue {
+    value: String,
+    item_type: String,
+    timestamp: String,
+    matched: bool,
+}
+
+// New monitor structures matching backend
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum MonitorState {
+    Running,
+    Paused,
+    Scheduled,
+    Completed,
+    Error { message: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct MonitorStatsData {
+    lines_processed: u64,
+    items_extracted: u64,
+    hits_found: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct MonitorStatus {
+struct Monitor {
+    id: String,
+    name: String,
+    monitor_type: MonitorTypeInfo,
+    config: MonitorConfigInfo,
     enabled: bool,
-    database_count: usize,
-    lines_processed: u64,
-    items_extracted: u64,
-    last_activity: String,
+    stats: MonitorStatsData,
+    state: MonitorState,
+    last_activity: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MonitorConfigInfo {
+    SystemLogs,
+    LogFile { path: String },
+    ApiEndpoint { url: String, interval_secs: u64 },
+    FilesystemScan { path: String, recursive: bool },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MonitorTypeInfo {
+    SystemLogs,
+    LogFile,
+    ApiEndpoint,
+    FilesystemScan,
 }
 
 #[component]
 pub fn App() -> impl IntoView {
     let (databases, set_databases) = signal::<Vec<DatabaseInfo>>(Vec::new());
-    let (hits, set_hits) = signal::<Vec<Hit>>(Vec::new());
-    let (query, set_query) = signal(String::new());
-    let (monitoring, set_monitoring) = signal(false);
-    let (status, set_status) = signal(String::new());
-    let (monitor_stats, set_monitor_stats) = signal(MonitorStatus {
-        enabled: false,
-        database_count: 0,
-        lines_processed: 0,
-        items_extracted: 0,
-        last_activity: String::new(),
-    });
+    let (hits, set_hits) = signal::<Vec<Hit>>(load_hits_from_storage());
+    let (query, _set_query) = signal(String::new());
+    let (_status, set_status) = signal(String::new());
+    let (monitors, set_monitors) = signal::<Vec<Monitor>>(Vec::new());
+    let (show_add_modal, set_show_add_modal) = signal(false);
+    let (show_edit_modal, set_show_edit_modal) = signal(false);
+    let (edit_monitor_id, set_edit_monitor_id) = signal(String::new());
+    let (selected_monitor_type, set_selected_monitor_type) = signal("log_file".to_string());
+    let (monitor_name, set_monitor_name) = signal(String::new());
+    let (log_file_path, set_log_file_path) = signal(String::new());
+    let (show_extracted_panel, set_show_extracted_panel) = signal(false);
+    let (extracted_items, set_extracted_items) = signal::<Vec<ExtractedValue>>(Vec::new());
+    let (show_error_modal, set_show_error_modal) = signal(false);
+    let (error_message, set_error_message) = signal(String::new());
+    let (databases_expanded, set_databases_expanded) = signal(load_collapse_state("databases_expanded", true));
+    let (monitors_expanded, set_monitors_expanded) = signal(load_collapse_state("monitors_expanded", true));
     
-    // Load databases on mount
+    // Load databases and monitors on mount
     Effect::new(move |_| {
         spawn_local(async move {
-            let res = invoke("list_databases", JsValue::NULL).await;
-            if let Ok(dbs) = serde_wasm_bindgen::from_value::<Vec<DatabaseInfo>>(res) {
-                set_databases.set(dbs);
+            if let Ok(res) = invoke("list_databases", JsValue::NULL).await {
+                if let Ok(dbs) = serde_wasm_bindgen::from_value::<Vec<DatabaseInfo>>(res) {
+                    set_databases.set(dbs);
+                }
             }
         });
         
-        // Get monitoring status
         spawn_local(async move {
-            let res = invoke("get_monitor_status", JsValue::NULL).await;
-            if let Ok(status) = serde_wasm_bindgen::from_value::<MonitorStatus>(res) {
-                set_monitoring.set(status.enabled);
-                set_monitor_stats.set(status);
+            if let Ok(res) = invoke("list_monitors", JsValue::NULL).await {
+                if let Ok(mons) = serde_wasm_bindgen::from_value::<Vec<Monitor>>(res) {
+                    set_monitors.set(mons);
+                }
             }
         });
     });
@@ -112,9 +229,12 @@ pub fn App() -> impl IntoView {
                                 log(&format!("Parsed hit: {:?}", hit));
                                 set_hits.update(|hits| {
                                     hits.insert(0, hit);
-                                    if hits.len() > 100 {
-                                        hits.truncate(100);
+                                    // Keep more hits now - 500 instead of 100
+                                    if hits.len() > 500 {
+                                        hits.truncate(500);
                                     }
+                                    // Save to localStorage after updating
+                                    save_hits_to_storage(hits);
                                 });
                             }
                             Err(e) => {
@@ -133,15 +253,47 @@ pub fn App() -> impl IntoView {
         });
     });
     
+    // Listen for extracted values
+    Effect::new(move |_| {
+        spawn_local(async move {
+            let closure = Closure::wrap(Box::new(move |event: JsValue| {
+                match js_sys::Reflect::get(&event, &"payload".into()) {
+                    Ok(payload) => {
+                        match serde_wasm_bindgen::from_value::<ExtractedValue>(payload) {
+                            Ok(extracted) => {
+                                set_extracted_items.update(|items| {
+                                    items.insert(0, extracted);
+                                    if items.len() > 200 {
+                                        items.truncate(200);
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                error(&format!("Failed to parse extracted value: {:?}", e));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error(&format!("Failed to get extracted payload: {:?}", e));
+                    }
+                }
+            }) as Box<dyn FnMut(JsValue)>);
+            
+            let _ = listen("extracted-value", closure.as_ref()).await;
+            closure.forget();
+        });
+    });
+    
     // Listen for database updates
     Effect::new(move |_| {
         spawn_local(async move {
             let closure = Closure::wrap(Box::new(move |_event: JsValue| {
                 // Refresh database list
                 spawn_local(async move {
-                    let res = invoke("list_databases", JsValue::NULL).await;
-                    if let Ok(dbs) = serde_wasm_bindgen::from_value::<Vec<DatabaseInfo>>(res) {
-                        set_databases.set(dbs);
+                    if let Ok(res) = invoke("list_databases", JsValue::NULL).await {
+                        if let Ok(dbs) = serde_wasm_bindgen::from_value::<Vec<DatabaseInfo>>(res) {
+                            set_databases.set(dbs);
+                        }
                     }
                 });
             }) as Box<dyn FnMut(JsValue)>);
@@ -151,47 +303,67 @@ pub fn App() -> impl IntoView {
         });
     });
     
-    // Listen for monitoring state changes from tray
+    // Listen for monitor updates
     Effect::new(move |_| {
         spawn_local(async move {
-            let closure = Closure::wrap(Box::new(move |event: JsValue| {
-                log("Received monitoring-changed event");
-                match js_sys::Reflect::get(&event, &"payload".into()) {
-                    Ok(payload) => {
-                        if let Ok(enabled) = serde_wasm_bindgen::from_value::<bool>(payload) {
-                            log(&format!("Monitoring changed to: {}", enabled));
-                            set_monitoring.set(enabled);
-                            // Refresh monitor stats
-                            spawn_local(async move {
-                                let res = invoke("get_monitor_status", JsValue::NULL).await;
-                                if let Ok(status) = serde_wasm_bindgen::from_value::<MonitorStatus>(res) {
-                                    set_monitor_stats.set(status);
-                                }
-                            });
+            let closure = Closure::wrap(Box::new(move |_event: JsValue| {
+                // Refresh monitors list
+                spawn_local(async move {
+                    if let Ok(res) = invoke("list_monitors", JsValue::NULL).await {
+                        if let Ok(mons) = serde_wasm_bindgen::from_value::<Vec<Monitor>>(res) {
+                            set_monitors.set(mons);
                         }
                     }
-                    Err(e) => {
-                        error(&format!("Failed to get monitoring-changed payload: {:?}", e));
-                    }
-                }
+                });
             }) as Box<dyn FnMut(JsValue)>);
             
-            let _ = listen("monitoring-changed", closure.as_ref()).await;
+            let _ = listen("monitors-updated", closure.as_ref()).await;
             closure.forget();
         });
     });
     
     let add_database = move |_| {
         spawn_local(async move {
-            let res = invoke("pick_file", JsValue::NULL).await;
-            if let Ok(Some(path)) = serde_wasm_bindgen::from_value::<Option<String>>(res) {
-                let args = serde_wasm_bindgen::to_value(&serde_json::json!({"path": path})).unwrap();
-                let res = invoke("load_database", args).await;
-                if let Ok(info) = serde_wasm_bindgen::from_value::<DatabaseInfo>(res) {
-                    set_databases.update(|dbs| dbs.push(info));
-                    set_status.set(format!("Loaded database: {}", path));
-                } else {
-                    set_status.set("Failed to load database".into());
+            match invoke("pick_file", JsValue::NULL).await {
+                Ok(res) => {
+                    if let Ok(Some(path)) = serde_wasm_bindgen::from_value::<Option<String>>(res) {
+                        let path_clone = path.clone();
+                        let args = serde_wasm_bindgen::to_value(&serde_json::json!({"path": path})).unwrap();
+                        
+                        // Now invoke can fail properly with Result
+                        match invoke("load_database", args).await {
+                            Ok(result_value) => {
+                                // Parse the successful result
+                                match serde_wasm_bindgen::from_value::<DatabaseInfo>(result_value) {
+                                    Ok(info) => {
+                                        set_databases.update(|dbs| dbs.push(info));
+                                    }
+                                    Err(e) => {
+                                        let error_msg = format!("Failed to parse database info: {:?}", e);
+                                        error(&error_msg);
+                                        set_error_message.set(error_msg);
+                                        set_show_error_modal.set(true);
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                // Error from Tauri command - extract the message
+                                let error_msg = err.as_string().unwrap_or_else(|| {
+                                    js_sys::Reflect::get(&err, &"message".into())
+                                        .ok()
+                                        .and_then(|v| v.as_string())
+                                        .unwrap_or_else(|| "Unknown error occurred while loading database".to_string())
+                                });
+                                
+                                error(&format!("Failed to load {}: {}", path_clone, error_msg));
+                                set_error_message.set(error_msg);
+                                set_show_error_modal.set(true);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error(&format!("Failed to pick file: {:?}", e));
                 }
             }
         });
@@ -200,155 +372,87 @@ pub fn App() -> impl IntoView {
     let remove_database = move |id: String| {
         spawn_local(async move {
             let args = serde_wasm_bindgen::to_value(&serde_json::json!({"id": id})).unwrap();
-            let _ = invoke("unload_database", args).await;
-            set_databases.update(|dbs| dbs.retain(|db| db.id != id));
+            if invoke("unload_database", args).await.is_ok() {
+                set_databases.update(|dbs| dbs.retain(|db| db.id != id));
+            }
         });
     };
     
-    let run_query = move |_ev: SubmitEvent| {
+    let _run_query = move |_ev: SubmitEvent| {
         _ev.prevent_default();
         let q = query.get_untracked();
         if q.is_empty() { return; }
         
         spawn_local(async move {
             let args = serde_wasm_bindgen::to_value(&serde_json::json!({"query": q})).unwrap();
-            let res = invoke("query_databases", args).await;
-            if let Ok(new_hits) = serde_wasm_bindgen::from_value::<Vec<Hit>>(res) {
-                if new_hits.is_empty() {
-                    set_status.set(format!("No hits for: {}", q));
-                } else {
-                    set_status.set(format!("Found {} hits", new_hits.len()));
-                    set_hits.update(|hits| {
-                        for hit in new_hits.into_iter().rev() {
-                            hits.insert(0, hit);
-                        }
-                        if hits.len() > 100 {
-                            hits.truncate(100);
-                        }
-                    });
+            if let Ok(res) = invoke("query_databases", args).await {
+                if let Ok(new_hits) = serde_wasm_bindgen::from_value::<Vec<Hit>>(res) {
+                    if new_hits.is_empty() {
+                        set_status.set(format!("No hits for: {}", q));
+                    } else {
+                        set_status.set(format!("Found {} hits", new_hits.len()));
+                        set_hits.update(|hits| {
+                            for hit in new_hits.into_iter().rev() {
+                                hits.insert(0, hit);
+                            }
+                            // Keep more hits now - 500 instead of 100
+                            if hits.len() > 500 {
+                                hits.truncate(500);
+                            }
+                            // Save to localStorage after updating
+                            save_hits_to_storage(hits);
+                        });
+                    }
                 }
             }
         });
     };
-    
-    let toggle_monitoring = move |_| {
-        let enabled = !monitoring.get_untracked();
-        spawn_local(async move {
-            let args = serde_wasm_bindgen::to_value(&serde_json::json!({"enabled": enabled})).unwrap();
-            let res = invoke("set_monitoring", args).await;
-            if let Ok(status) = serde_wasm_bindgen::from_value::<MonitorStatus>(res) {
-                set_monitoring.set(status.enabled);
-                set_monitor_stats.set(status.clone());
-                set_status.set(if status.enabled {
-                    format!("Monitoring enabled - {} database(s)", status.database_count)
-                } else {
-                    "Monitoring disabled".into()
-                });
-            }
-        });
-    };
-    
-    // Poll monitoring stats when enabled
-    Effect::new(move |_| {
-        let is_monitoring = monitoring.get();
-        if is_monitoring {
-            spawn_local(async move {
-                loop {
-                    if !monitoring.get_untracked() {
-                        break;
-                    }
-                    
-                    let res = invoke("get_monitor_status", JsValue::NULL).await;
-                    if let Ok(status) = serde_wasm_bindgen::from_value::<MonitorStatus>(res) {
-                        set_monitor_stats.set(status);
-                    }
-                    
-                    // Wait 1 second
-                    gloo_timers::future::TimeoutFuture::new(1000).await;
-                }
-            });
-        }
-    });
     
     view! {
-        <main style="display: flex; flex-direction: column; height: 100vh; background: #f8f9fa; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
-            // Toolbar
-            <div style="display: flex; align-items: center; padding: 1rem 1.5rem; background: white; border-bottom: 1px solid #e5e7eb; gap: 1rem; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
-                <button
-                    on:click=add_database
-                    style="padding: 0.5rem 1rem; background: #3b82f6; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 0.875rem; font-weight: 500; transition: all 0.2s; box-shadow: 0 1px 2px rgba(59, 130, 246, 0.3);"
-                    onmouseover="this.style.background='#2563eb'; this.style.boxShadow='0 2px 4px rgba(59, 130, 246, 0.4)'"
-                    onmouseout="this.style.background='#3b82f6'; this.style.boxShadow='0 1px 2px rgba(59, 130, 246, 0.3)'"
-                >
-                    "+ Add Database"
-                </button>
-                
-                <form on:submit=run_query style="display: flex; flex: 1; gap: 0.625rem; max-width: 550px;">
-                    <input
-                        placeholder="Search IP, domain, hash..."
-                        on:input=move |ev| set_query.set(event_target_value(&ev))
-                        prop:value=move || query.get()
-                        style="flex: 1; padding: 0.625rem 1rem; border: 1.5px solid #e5e7eb; border-radius: 8px; font-size: 0.875rem; background: white; transition: all 0.2s; box-shadow: 0 1px 2px rgba(0,0,0,0.02);"
-                        onfocus="this.style.borderColor='#3b82f6'; this.style.boxShadow='0 0 0 3px rgba(59, 130, 246, 0.1)'"
-                        onblur="this.style.borderColor='#e5e7eb'; this.style.boxShadow='0 1px 2px rgba(0,0,0,0.02)'"
-                    />
-                    <button
-                        type="submit"
-                        style="padding: 0.625rem 1.25rem; background: #3b82f6; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 0.875rem; font-weight: 500; transition: all 0.2s; box-shadow: 0 1px 2px rgba(59, 130, 246, 0.3);"
-                        onmouseover="this.style.background='#2563eb'; this.style.boxShadow='0 2px 4px rgba(59, 130, 246, 0.4)'"
-                        onmouseout="this.style.background='#3b82f6'; this.style.boxShadow='0 1px 2px rgba(59, 130, 246, 0.3)'"
-                    >
-                        "Search"
-                    </button>
-                </form>
-                
-                <button
-                    on:click=toggle_monitoring
-                    style=move || format!("padding: 0.625rem 1rem; background: {}; color: {}; border: 1.5px solid {}; border-radius: 8px; cursor: pointer; font-size: 0.875rem; font-weight: 500; transition: all 0.2s; box-shadow: {};",
-                        if monitoring.get() { "#10b981" } else { "white" },
-                        if monitoring.get() { "white" } else { "#6b7280" },
-                        if monitoring.get() { "#10b981" } else { "#e5e7eb" },
-                        if monitoring.get() { "0 1px 2px rgba(16, 185, 129, 0.3)" } else { "0 1px 2px rgba(0,0,0,0.02)" }
-                    )
-                >
-                    {move || if monitoring.get() { "⏸ Monitoring" } else { "▶ Monitor Logs" }}
-                </button>
-                
-                // Show monitoring stats when active
-                {move || {
-                    let stats = monitor_stats.get();
-                    if stats.enabled {
-                        view! {
-                            <div style="display: flex; gap: 0.75rem; align-items: center; padding: 0.5rem 0.875rem; background: #ecfdf5; border: 1px solid #d1fae5; border-radius: 8px; font-size: 0.8125rem; color: #065f46;">
-                                <div style="display: flex; align-items: center; gap: 0.375rem;">
-                                    <span style="color: #10b981; font-weight: 600; animation: pulse 2s ease-in-out infinite;">"●"</span>
-                                    <span style="color: #065f46; font-weight: 600;">"Live"</span>
-                                </div>
-                                <div style="color: #047857; font-weight: 500;">{format!("{}", stats.lines_processed)}</div>
-                                <div style="color: #047857; font-weight: 500;">{format!("{} extracted", stats.items_extracted)}</div>
-                                {if !stats.last_activity.is_empty() {
-                                    view! {
-                                        <div style="color: #059669; font-size: 0.75rem;">
-                                            {format!("Last: {}", stats.last_activity)}
-                                        </div>
-                                    }.into_any()
-                                } else {
-                                    view! { <></> }.into_any()
-                                }}
-                            </div>
-                        }.into_any()
-                    } else {
-                        view! { <></> }.into_any()
-                    }
-                }}
+        <main style="display: flex; flex-direction: column; height: 100vh; background: #f8f9fa; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; position: relative;">
+            // Drag region header  
+            <div class="titlebar" style="height: 32px; background: #f9fafb; border-bottom: 1px solid #e5e7eb; flex-shrink: 0;">
+                <div data-tauri-drag-region style="width: 100%; height: 100%;"></div>
             </div>
             
             <div style="display: flex; flex: 1; overflow: hidden;">
-                // Sidebar - Database List
-                <div style="width: 240px; background: #f9fafb; border-right: 1px solid #e5e7eb; overflow-y: auto; padding: 1rem;">
-                    <h2 style="margin: 0 0 1rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.8px; color: #6b7280; font-weight: 700;">
-                        "Databases"
-                    </h2>
+                // Sidebar - Database List and Monitors
+                <div style="width: 280px; background: #f9fafb; border-right: 1px solid #e5e7eb; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1.5rem;">
+                    // Databases section
+                    <div>
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                            <h2 style="margin: 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.8px; color: #6b7280; font-weight: 700; cursor: pointer; user-select: none; flex: 1;"
+                                on:click=move |_| {
+                                    set_databases_expanded.update(|expanded| {
+                                        *expanded = !*expanded;
+                                        save_collapse_state("databases_expanded", *expanded);
+                                    });
+                                }>
+                                {move || if databases_expanded.get() { "▼ Databases" } else { "▶ Databases" }}
+                            </h2>
+                            <div style="display: flex; align-items: center; gap: 0.375rem;">
+                                <span style="background: #3b82f6; color: white; border-radius: 10px; padding: 0.25rem 0.5rem; font-size: 0.875rem; font-weight: 600; min-width: 1.25rem; text-align: center;">
+                                    {move || databases.get().len()}
+                                </span>
+                                <button
+                                    on:click=add_database
+                                    style="background: none; border: none; color: #3b82f6; cursor: pointer; padding: 0.25rem 0.5rem; font-size: 1rem; line-height: 1; transition: all 0.15s; border-radius: 4px; font-weight: 600;"
+                                    onmouseover="this.style.background='#eff6ff'; this.style.color='#2563eb'"
+                                    onmouseout="this.style.background='none'; this.style.color='#3b82f6'"
+                                    title="Add Database"
+                                >
+                                    "+"
+                                </button>
+                            </div>
+                        </div>
+                    <div style=move || format!(
+                        "overflow: hidden; transition: max-height 0.33s ease-in-out; {}",
+                        if databases_expanded.get() {
+                            "max-height: 2000px;"
+                        } else {
+                            "max-height: 0;"
+                        }
+                    )>
                     {move || {
                         let dbs = databases.get();
                         if dbs.is_empty() {
@@ -370,41 +474,61 @@ pub fn App() -> impl IntoView {
                                             .to_string();
                                         
                                         view! {
-                                            <div style="padding: 0.875rem; background: white; border-radius: 8px; font-size: 0.8125rem; transition: all 0.2s; border: 1px solid #e5e7eb; box-shadow: 0 1px 2px rgba(0,0,0,0.02);"
+                                            <div style="padding: 0.625rem; background: white; border-radius: 6px; font-size: 0.75rem; transition: all 0.2s; border: 1px solid #e5e7eb; box-shadow: 0 1px 2px rgba(0,0,0,0.02);"
                                                  onmouseover="this.style.boxShadow='0 2px 8px rgba(0,0,0,0.08)'; this.style.borderColor='#d1d5db'"
                                                  onmouseout="this.style.boxShadow='0 1px 2px rgba(0,0,0,0.02)'; this.style.borderColor='#e5e7eb'">
-                                                <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 0.625rem;">
-                                                    <div style="font-weight: 600; word-break: break-all; color: #111827; line-height: 1.4; font-size: 0.875rem;">
+                                                <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 0.375rem;">
+                                                    <div style="font-weight: 600; word-break: break-all; color: #111827; line-height: 1.3; font-size: 0.8125rem;">
                                                         {filename}
                                                     </div>
                                                     <button
                                                         on:click=move |_| remove_database(id.clone())
-                                                        style="background: none; border: none; color: #9ca3af; cursor: pointer; padding: 0.125rem; font-size: 1.25rem; line-height: 1; transition: all 0.15s; margin-left: 0.625rem; flex-shrink: 0; border-radius: 4px;"
+                                                        style="background: none; border: none; color: #9ca3af; cursor: pointer; padding: 0; font-size: 1.125rem; line-height: 1; transition: all 0.15s; margin-left: 0.5rem; flex-shrink: 0; border-radius: 3px;"
                                                         onmouseover="this.style.color='#ef4444'; this.style.background='#fee2e2'"
                                                         onmouseout="this.style.color='#9ca3af'; this.style.background='none'"
                                                     >
                                                         "×"
                                                     </button>
                                                 </div>
-                                                <div style="color: #6b7280; font-size: 0.75rem; margin-bottom: 0.5rem;">
-                                                    {db.size_human.clone()}
+                                                
+                                                // Show description if available
+                                                {db.description.as_ref().map(|desc| {
+                                                    view! {
+                                                        <div style="margin-bottom: 0.5rem; padding: 0.375rem; background: #f9fafb; border-radius: 4px; border-left: 3px solid #3b82f6;">
+                                                            <p style="margin: 0; color: #374151; font-size: 0.6875rem; line-height: 1.4; font-style: italic;">
+                                                                {desc.clone()}
+                                                            </p>
+                                                        </div>
+                                                    }.into_any()
+                                                }).unwrap_or_else(|| view! { <></> }.into_any())}
+                                                
+                                                // Show build date if available
+                                                {db.build_epoch.map(|epoch| {
+                                                    // Format Unix timestamp to human-readable date
+                                                    let date = chrono::DateTime::from_timestamp(epoch as i64, 0)
+                                                        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                                                        .unwrap_or_else(|| "Unknown date".to_string());
+                                                    
+                                                    view! {
+                                                        <div style="margin-bottom: 0.5rem; color: #6b7280; font-size: 0.6875rem;">
+                                                            <span style="font-weight: 500;">"Built: "</span>
+                                                            <span>{date}</span>
+                                                        </div>
+                                                    }.into_any()
+                                                }).unwrap_or_else(|| view! { <></> }.into_any())}
+                                                
+                                                // Compact stats in two rows
+                                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.25rem;">
+                                                    <span style="color: #6b7280; font-size: 0.6875rem;">{db.size_human.clone()}</span>
+                                                    <span style="color: #6b7280; font-size: 0.6875rem;">
+                                                        <span style="font-weight: 600; color: #111827;">{format!("{}", db.indicator_counts.total)}</span>
+                                                        <span>" indicators"</span>
+                                                    </span>
                                                 </div>
                                                 
-                                                // Indicator counts section
-                                                <div style="color: #6b7280; font-size: 0.75rem; margin-bottom: 0.5rem;">
-                                                    <span style="font-weight: 600; color: #111827;">{format!("{}", db.indicator_counts.total)}</span>
-                                                    <span>" indicators"</span>
-                                                </div>
-                                                
-                                                <div style="color: #6b7280; font-size: 0.75rem; margin-bottom: 0.25rem;">
-                                                    {format!("{} queries", db.stats.total_queries)}
-                                                </div>
-                                                <div style="color: #6b7280; font-size: 0.75rem; margin-bottom: 0.25rem;">
-                                                    {format!("{} hits", db.stats.queries_with_match)}
-                                                </div>
-                                                <div style="display: flex; align-items: center; gap: 0.375rem; color: #6b7280; font-size: 0.75rem;">
-                                                    <span>"Match rate:"</span>
-                                                    <span style="color: #3b82f6; font-weight: 600;">{format!("{:.1}%", db.stats.match_rate * 100.0)}</span>
+                                                <div style="display: flex; justify-content: space-between; align-items: center; color: #6b7280; font-size: 0.6875rem;">
+                                                    <span>{format!("{}/{}", db.stats.queries_with_match, db.stats.total_queries)}</span>
+                                                    <span style="color: #3b82f6; font-weight: 600;">{format!("{:.0}%", db.stats.match_rate * 100.0)}</span>
                                                 </div>
                                             </div>
                                         }
@@ -413,6 +537,115 @@ pub fn App() -> impl IntoView {
                             }.into_any()
                         }
                     }}
+                    </div>
+                    </div>
+                    
+                    // Monitors section
+                    <div>
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                            <h2 style="margin: 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.8px; color: #6b7280; font-weight: 700; cursor: pointer; user-select: none; flex: 1;"
+                                on:click=move |_| {
+                                    set_monitors_expanded.update(|expanded| {
+                                        *expanded = !*expanded;
+                                        save_collapse_state("monitors_expanded", *expanded);
+                                    });
+                                }>
+                                {move || if monitors_expanded.get() { "▼ Monitors" } else { "▶ Monitors" }}
+                            </h2>
+                            <div style="display: flex; align-items: center; gap: 0.375rem;">
+                                <span style="background: #3b82f6; color: white; border-radius: 10px; padding: 0.25rem 0.5rem; font-size: 0.875rem; font-weight: 600; min-width: 1.25rem; text-align: center;">
+                                    {move || monitors.get().len()}
+                                </span>
+                                <button
+                                    on:click=move |_| set_show_add_modal.set(true)
+                                    style="background: none; border: none; color: #3b82f6; cursor: pointer; padding: 0.25rem 0.5rem; font-size: 1rem; line-height: 1; transition: all 0.15s; border-radius: 4px; font-weight: 600;"
+                                    onmouseover="this.style.background='#eff6ff'; this.style.color='#2563eb'"
+                                    onmouseout="this.style.background='none'; this.style.color='#3b82f6'"
+                                    title="Add Monitor"
+                                >
+                                    "+"
+                                </button>
+                            </div>
+                        </div>
+                        
+                    <div style=move || format!(
+                        "overflow: hidden; transition: max-height 0.33s ease-in-out; {}",
+                        if monitors_expanded.get() {
+                            "max-height: 2000px;"
+                        } else {
+                            "max-height: 0;"
+                        }
+                    )>
+                        {move || {
+                            let monitor_list = monitors.get();
+                            if monitor_list.is_empty() {
+                                view! {
+                                    <div style="text-align: center; padding: 2rem 0; color: #9ca3af;">
+                                        <div style="font-size: 2rem; margin-bottom: 0.5rem;">"📊"</div>
+                                        <p style="font-size: 0.8125rem; margin: 0;">"No monitors"</p>
+                                    </div>
+                                }.into_any()
+                            } else {
+                                view! {
+                                    <div style="display: flex; flex-direction: column; gap: 0.75rem;">
+                                        {monitor_list.into_iter().map(|monitor| {
+                                            let monitor_id = monitor.id.clone();
+                                            let monitor_id_for_remove = monitor.id.clone();
+                                            let monitor_id_for_edit = monitor.id.clone();
+                                            let monitor_for_edit = monitor.clone();
+                                            let is_system = monitor.monitor_type == MonitorTypeInfo::SystemLogs;
+                                            
+                                            let toggle_fn = move |_| {
+                                                let id = monitor_id.clone();
+                                                spawn_local(async move {
+                                                    let args = serde_wasm_bindgen::to_value(&serde_json::json!({"id": id})).unwrap();
+                                                    let _ = invoke("toggle_monitor", args).await.ok();
+                                                });
+                                            };
+                                            
+                                            let remove_fn = move |_| {
+                                                let id = monitor_id_for_remove.clone();
+                                                spawn_local(async move {
+                                                    let args = serde_wasm_bindgen::to_value(&serde_json::json!({"id": id})).unwrap();
+                                                    let _ = invoke("remove_monitor", args).await.ok();
+                                                });
+                                            };
+                                            
+                                            let edit_fn = move |_| {
+                                                if !is_system && !monitor_for_edit.enabled {
+                                                    // Populate edit modal with current values
+                                                    set_edit_monitor_id.set(monitor_id_for_edit.clone());
+                                                    set_monitor_name.set(monitor_for_edit.name.clone());
+                                                    
+                                                    // Set config based on monitor config
+                                                    match &monitor_for_edit.config {
+                                                        MonitorConfigInfo::LogFile { path } => {
+                                                            set_selected_monitor_type.set("log_file".to_string());
+                                                            set_log_file_path.set(path.clone());
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                    
+                                                    set_show_edit_modal.set(true);
+                                                }
+                                            };
+                                            
+                                            view! {
+                                                <MonitorCardNew 
+                                                    monitor=monitor 
+                                                    on_toggle=toggle_fn
+                                                    on_remove=remove_fn
+                                                    on_edit=edit_fn
+                                                    can_remove=!is_system
+                                                />
+                                            }
+                                        }).collect::<Vec<_>>()}
+                                    </div>
+                                }.into_any()
+                            }
+                        }}
+                    </div>
+                    </div>
                 </div>
                 
                 // Main Content - Hit Feed
@@ -420,6 +653,7 @@ pub fn App() -> impl IntoView {
                     <h2 style="margin: 0 0 1.25rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.8px; color: #6b7280; font-weight: 700;">
                         "Intelligence Hits"
                     </h2>
+                    
                     {move || {
                         let hit_list = hits.get();
                         if hit_list.is_empty() {
@@ -444,9 +678,493 @@ pub fn App() -> impl IntoView {
                     }}
                 </div>
             </div>
+            
+            // Add Monitor Modal
+            {move || {
+                if show_add_modal.get() {
+                    view! {
+                        <AddMonitorModal
+                            _show=show_add_modal
+                            set_show=set_show_add_modal
+                            selected_type=selected_monitor_type
+                            set_selected_type=set_selected_monitor_type
+                            monitor_name=monitor_name
+                            set_monitor_name=set_monitor_name
+                            log_file_path=log_file_path
+                            set_log_file_path=set_log_file_path
+                        />
+                    }.into_any()
+                } else {
+                    view! { <></> }.into_any()
+                }
+            }}
+            
+            // Edit Monitor Modal
+            {move || {
+                if show_edit_modal.get() {
+                    view! {
+                        <EditMonitorModal
+                            _show=show_edit_modal
+                            set_show=set_show_edit_modal
+                            monitor_id=edit_monitor_id
+                            selected_type=selected_monitor_type
+                            _set_selected_type=set_selected_monitor_type
+                            monitor_name=monitor_name
+                            set_monitor_name=set_monitor_name
+                            log_file_path=log_file_path
+                            set_log_file_path=set_log_file_path
+                        />
+                    }.into_any()
+                } else {
+                    view! { <></> }.into_any()
+                }
+            }}
+            
+            // Error Modal
+            {move || {
+                if show_error_modal.get() {
+                    view! {
+                        <ErrorModal
+                            message=error_message
+                            set_show=set_show_error_modal
+                        />
+                    }.into_any()
+                } else {
+                    view! { <></> }.into_any()
+                }
+            }}
+            
+            // Extracted Values Panel
+            <ExtractedValuesPanel 
+                show=show_extracted_panel
+                set_show=set_show_extracted_panel
+                items=extracted_items
+            />
+            
+            // Floating toggle button for extracted values panel
+            <button
+                on:click=move |_| set_show_extracted_panel.update(|show| *show = !*show)
+                style=move || format!(
+                    "position: fixed; bottom: 2rem; right: 2rem; width: 3.5rem; height: 3.5rem; background: {}; color: white; border: none; border-radius: 50%; cursor: pointer; font-size: 1.25rem; font-weight: 600; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4); transition: all 0.2s; z-index: 900; display: flex; align-items: center; justify-content: center;",
+                    if show_extracted_panel.get() { "#10b981" } else { "#3b82f6" }
+                )
+                onmouseover="this.style.transform='scale(1.1)'; this.style.boxShadow='0 6px 16px rgba(59, 130, 246, 0.5)'"
+                onmouseout="this.style.transform='scale(1)'; this.style.boxShadow='0 4px 12px rgba(59, 130, 246, 0.4)'"
+                title="Toggle Extracted Values"
+            >
+                {move || if show_extracted_panel.get() { "✓" } else { "📊" }}
+            </button>
         </main>
     }
 }
+
+#[component]
+fn AddMonitorModal(
+    _show: ReadSignal<bool>,
+    set_show: WriteSignal<bool>,
+    selected_type: ReadSignal<String>,
+    set_selected_type: WriteSignal<String>,
+    monitor_name: ReadSignal<String>,
+    set_monitor_name: WriteSignal<String>,
+    log_file_path: ReadSignal<String>,
+    set_log_file_path: WriteSignal<String>,
+) -> impl IntoView {
+    let pick_log_file = move |_| {
+        spawn_local(async move {
+            if let Ok(res) = invoke("pick_any_file", JsValue::NULL).await {
+                if let Ok(Some(path)) = serde_wasm_bindgen::from_value::<Option<String>>(res) {
+                    set_log_file_path.set(path);
+                }
+            }
+        });
+    };
+    
+    let create_monitor = move |_: leptos::ev::MouseEvent| {
+        let mon_type = selected_type.get_untracked();
+        let name = monitor_name.get_untracked();
+        let file_path = log_file_path.get_untracked();
+        
+        if name.is_empty() {
+            return;
+        }
+        
+        spawn_local(async move {
+            let config = if mon_type == "log_file" {
+                if file_path.is_empty() {
+                    return;
+                }
+                serde_json::json!({
+                    "type": "log_file",
+                    "path": file_path
+                })
+            } else {
+                return;
+            };
+            
+            let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+                "name": name,
+                "config": config
+            })).unwrap();
+            
+            if invoke("add_monitor", args).await.is_ok() {
+                // Reset form and close modal
+                set_monitor_name.set(String::new());
+                set_log_file_path.set(String::new());
+                set_show.set(false);
+            }
+        });
+    };
+    
+    view! {
+        <div style="position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; z-index: 1000;">
+            <div style="background: white; border-radius: 12px; padding: 1.5rem; width: 90%; max-width: 500px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
+                    <h2 style="margin: 0; font-size: 1.25rem; font-weight: 700; color: #111827;">"Add Monitor"</h2>
+                    <button
+                        on:click=move |_| set_show.set(false)
+                        style="background: none; border: none; color: #9ca3af; cursor: pointer; font-size: 1.5rem; padding: 0.25rem; line-height: 1; border-radius: 4px; transition: all 0.15s;"
+                        onmouseover="this.style.color='#ef4444'; this.style.background='#fee2e2'"
+                        onmouseout="this.style.color='#9ca3af'; this.style.background='none'"
+                    >
+                        "×"
+                    </button>
+                </div>
+                
+                // Monitor Name
+                <div style="margin-bottom: 1.25rem;">
+                    <label style="display: block; font-size: 0.875rem; font-weight: 600; color: #374151; margin-bottom: 0.5rem;">"Monitor Name"</label>
+                    <input
+                        placeholder="My Custom Monitor"
+                        on:input=move |ev| set_monitor_name.set(event_target_value(&ev))
+                        prop:value=move || monitor_name.get()
+                        style="width: 100%; padding: 0.625rem; border: 1.5px solid #e5e7eb; border-radius: 8px; font-size: 0.875rem; transition: all 0.2s;"
+                        onfocus="this.style.borderColor='#3b82f6'; this.style.boxShadow='0 0 0 3px rgba(59, 130, 246, 0.1)'"
+                        onblur="this.style.borderColor='#e5e7eb'; this.style.boxShadow='none'"
+                    />
+                </div>
+                
+                // Monitor Type
+                <div style="margin-bottom: 1.25rem;">
+                    <label style="display: block; font-size: 0.875rem; font-weight: 600; color: #374151; margin-bottom: 0.5rem;">"Monitor Type"</label>
+                    <select
+                        on:change=move |ev| set_selected_type.set(event_target_value(&ev))
+                        prop:value=move || selected_type.get()
+                        style="width: 100%; padding: 0.625rem; border: 1.5px solid #e5e7eb; border-radius: 8px; font-size: 0.875rem; background: white; cursor: pointer;"
+                    >
+                        <option value="log_file">"📄 Log File"</option>
+                    </select>
+                </div>
+                
+                // Log File Configuration
+                {move || {
+                    if selected_type.get() == "log_file" {
+                        view! {
+                            <div style="margin-bottom: 1.25rem; padding: 1rem; background: #f9fafb; border-radius: 8px;">
+                                <label style="display: block; font-size: 0.875rem; font-weight: 600; color: #374151; margin-bottom: 0.5rem;">"Log File Path"</label>
+                                <div style="display: flex; gap: 0.5rem;">
+                                    <input
+                                        placeholder="/var/log/app.log"
+                                        prop:value=move || log_file_path.get()
+                                        on:input=move |ev| set_log_file_path.set(event_target_value(&ev))
+                                        style="flex: 1; padding: 0.625rem; border: 1.5px solid #e5e7eb; border-radius: 8px; font-size: 0.875rem; font-family: 'SF Mono', monospace;"
+                                    />
+                                    <button
+                                        on:click=pick_log_file
+                                        style="padding: 0.625rem 1rem; background: #3b82f6; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 0.875rem; font-weight: 500; transition: all 0.2s;"
+                                        onmouseover="this.style.background='#2563eb'"
+                                        onmouseout="this.style.background='#3b82f6'"
+                                    >
+                                        "Browse"
+                                    </button>
+                                </div>
+                            </div>
+                        }.into_any()
+                    } else {
+                        view! { <></> }.into_any()
+                    }
+                }}
+                
+                // Actions
+                <div style="display: flex; gap: 0.75rem; justify-content: flex-end; margin-top: 1.5rem;">
+                    <button
+                        on:click=move |_| set_show.set(false)
+                        style="padding: 0.625rem 1.25rem; background: white; color: #6b7280; border: 1.5px solid #e5e7eb; border-radius: 8px; cursor: pointer; font-size: 0.875rem; font-weight: 500; transition: all 0.2s;"
+                        onmouseover="this.style.background='#f9fafb'"
+                        onmouseout="this.style.background='white'"
+                    >
+                        "Cancel"
+                    </button>
+                    <button
+                        on:click=create_monitor
+                        style="padding: 0.625rem 1.25rem; background: #3b82f6; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 0.875rem; font-weight: 500; transition: all 0.2s;"
+                        onmouseover="this.style.background='#2563eb'"
+                        onmouseout="this.style.background='#3b82f6'"
+                    >
+                        "Create Monitor"
+                    </button>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn EditMonitorModal(
+    _show: ReadSignal<bool>,
+    set_show: WriteSignal<bool>,
+    monitor_id: ReadSignal<String>,
+    selected_type: ReadSignal<String>,
+    _set_selected_type: WriteSignal<String>,
+    monitor_name: ReadSignal<String>,
+    set_monitor_name: WriteSignal<String>,
+    log_file_path: ReadSignal<String>,
+    set_log_file_path: WriteSignal<String>,
+) -> impl IntoView {
+    let pick_log_file = move |_| {
+        spawn_local(async move {
+            if let Ok(res) = invoke("pick_any_file", JsValue::NULL).await {
+                if let Ok(Some(path)) = serde_wasm_bindgen::from_value::<Option<String>>(res) {
+                    set_log_file_path.set(path);
+                }
+            }
+        });
+    };
+    
+    let update_monitor = move |_: leptos::ev::MouseEvent| {
+        let id = monitor_id.get_untracked();
+        let mon_type = selected_type.get_untracked();
+        let name = monitor_name.get_untracked();
+        let file_path = log_file_path.get_untracked();
+        
+        if name.is_empty() {
+            return;
+        }
+        
+        spawn_local(async move {
+            let config = if mon_type == "log_file" {
+                if file_path.is_empty() {
+                    return;
+                }
+                serde_json::json!({
+                    "type": "log_file",
+                    "path": file_path
+                })
+            } else {
+                return;
+            };
+            
+            let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+                "id": id,
+                "name": name,
+                "config": config
+            })).unwrap();
+            
+            if invoke("update_monitor", args).await.is_ok() {
+                // Reset form and close modal
+                set_monitor_name.set(String::new());
+                set_log_file_path.set(String::new());
+                set_show.set(false);
+            }
+        });
+    };
+    
+    view! {
+        <div style="position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; z-index: 1000;">
+            <div style="background: white; border-radius: 12px; padding: 1.5rem; width: 90%; max-width: 500px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
+                    <h2 style="margin: 0; font-size: 1.25rem; font-weight: 700; color: #111827;">"Edit Monitor"</h2>
+                    <button
+                        on:click=move |_| set_show.set(false)
+                        style="background: none; border: none; color: #9ca3af; cursor: pointer; font-size: 1.5rem; padding: 0.25rem; line-height: 1; border-radius: 4px; transition: all 0.15s;"
+                        onmouseover="this.style.color='#ef4444'; this.style.background='#fee2e2'"
+                        onmouseout="this.style.color='#9ca3af'; this.style.background='none'"
+                    >
+                        "×"
+                    </button>
+                </div>
+                
+                // Monitor Name
+                <div style="margin-bottom: 1.25rem;">
+                    <label style="display: block; font-size: 0.875rem; font-weight: 600; color: #374151; margin-bottom: 0.5rem;">"Monitor Name"</label>
+                    <input
+                        placeholder="My Custom Monitor"
+                        on:input=move |ev| set_monitor_name.set(event_target_value(&ev))
+                        prop:value=move || monitor_name.get()
+                        style="width: 100%; padding: 0.625rem; border: 1.5px solid #e5e7eb; border-radius: 8px; font-size: 0.875rem; transition: all 0.2s;"
+                        onfocus="this.style.borderColor='#3b82f6'; this.style.boxShadow='0 0 0 3px rgba(59, 130, 246, 0.1)'"
+                        onblur="this.style.borderColor='#e5e7eb'; this.style.boxShadow='none'"
+                    />
+                </div>
+                
+                // Monitor Type (read-only for now)
+                <div style="margin-bottom: 1.25rem;">
+                    <label style="display: block; font-size: 0.875rem; font-weight: 600; color: #374151; margin-bottom: 0.5rem;">"Monitor Type"</label>
+                    <select
+                        disabled
+                        prop:value=move || selected_type.get()
+                        style="width: 100%; padding: 0.625rem; border: 1.5px solid #e5e7eb; border-radius: 8px; font-size: 0.875rem; background: #f9fafb; cursor: not-allowed;"
+                    >
+                        <option value="log_file">"📄 Log File"</option>
+                    </select>
+                </div>
+                
+                // Log File Configuration
+                {move || {
+                    if selected_type.get() == "log_file" {
+                        view! {
+                            <div style="margin-bottom: 1.25rem; padding: 1rem; background: #f9fafb; border-radius: 8px;">
+                                <label style="display: block; font-size: 0.875rem; font-weight: 600; color: #374151; margin-bottom: 0.5rem;">"Log File Path"</label>
+                                <div style="display: flex; gap: 0.5rem;">
+                                    <input
+                                        placeholder="/var/log/app.log"
+                                        prop:value=move || log_file_path.get()
+                                        on:input=move |ev| set_log_file_path.set(event_target_value(&ev))
+                                        style="flex: 1; padding: 0.625rem; border: 1.5px solid #e5e7eb; border-radius: 8px; font-size: 0.875rem; font-family: 'SF Mono', monospace;"
+                                    />
+                                    <button
+                                        on:click=pick_log_file
+                                        style="padding: 0.625rem 1rem; background: #3b82f6; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 0.875rem; font-weight: 500; transition: all 0.2s;"
+                                        onmouseover="this.style.background='#2563eb'"
+                                        onmouseout="this.style.background='#3b82f6'"
+                                    >
+                                        "Browse"
+                                    </button>
+                                </div>
+                            </div>
+                        }.into_any()
+                    } else {
+                        view! { <></> }.into_any()
+                    }
+                }}
+                
+                // Actions
+                <div style="display: flex; gap: 0.75rem; justify-content: flex-end; margin-top: 1.5rem;">
+                    <button
+                        on:click=move |_| set_show.set(false)
+                        style="padding: 0.625rem 1.25rem; background: white; color: #6b7280; border: 1.5px solid #e5e7eb; border-radius: 8px; cursor: pointer; font-size: 0.875rem; font-weight: 500; transition: all 0.2s;"
+                        onmouseover="this.style.background='#f9fafb'"
+                        onmouseout="this.style.background='white'"
+                    >
+                        "Cancel"
+                    </button>
+                    <button
+                        on:click=update_monitor
+                        style="padding: 0.625rem 1.25rem; background: #3b82f6; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 0.875rem; font-weight: 500; transition: all 0.2s;"
+                        onmouseover="this.style.background='#2563eb'"
+                        onmouseout="this.style.background='#3b82f6'"
+                    >
+                        "Update Monitor"
+                    </button>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn MonitorCardNew(
+    monitor: Monitor,
+    on_toggle: impl Fn(leptos::ev::MouseEvent) + 'static,
+    on_remove: impl Fn(leptos::ev::MouseEvent) + 'static,
+    on_edit: impl Fn(leptos::ev::MouseEvent) + 'static,
+    can_remove: bool,
+) -> impl IntoView {
+    let type_icon = match &monitor.monitor_type {
+        MonitorTypeInfo::SystemLogs => "💻",
+        MonitorTypeInfo::LogFile => "📄",
+        MonitorTypeInfo::ApiEndpoint => "🌐",
+        MonitorTypeInfo::FilesystemScan => "🔍",
+    };
+    
+    view! {
+        <div style="padding: 0.875rem; background: white; border-radius: 8px; font-size: 0.8125rem; transition: all 0.2s; border: 1px solid #e5e7eb; box-shadow: 0 1px 2px rgba(0,0,0,0.02); cursor: pointer;"
+             onmouseover="this.style.boxShadow='0 2px 8px rgba(0,0,0,0.08)'; this.style.borderColor='#d1d5db'"
+             onmouseout="this.style.boxShadow='0 1px 2px rgba(0,0,0,0.02)'; this.style.borderColor='#e5e7eb'"
+             on:dblclick=on_edit>
+            
+            // Header with name, toggle, and remove button
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
+                <div style="display: flex; align-items: center; gap: 0.5rem; flex: 1; min-width: 0;">
+                    <span style="font-size: 1.25rem;">{type_icon}</span>
+                    <span style="font-weight: 600; color: #111827; font-size: 0.875rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{monitor.name.clone()}</span>
+                </div>
+                <div style="display: flex; gap: 0.5rem; align-items: center;">
+                    {if can_remove {
+                        view! {
+                            <button
+                                on:click=on_remove
+                                style="background: none; border: none; color: #9ca3af; cursor: pointer; padding: 0.125rem; font-size: 1.125rem; line-height: 1; transition: all 0.15s; border-radius: 4px;"
+                                onmouseover="this.style.color='#ef4444'; this.style.background='#fee2e2'"
+                                onmouseout="this.style.color='#9ca3af'; this.style.background='none'"
+                            >
+                                "×"
+                            </button>
+                        }.into_any()
+                    } else {
+                        view! { <></> }.into_any()
+                    }}
+                    <button
+                        on:click=on_toggle
+                        style=format!(
+                            "padding: 0.25rem 0.5rem; background: {}; color: {}; border: 1px solid {}; border-radius: 6px; cursor: pointer; font-size: 0.6875rem; font-weight: 600; transition: all 0.15s;",
+                            if monitor.enabled { "#10b981" } else { "#f3f4f6" },
+                            if monitor.enabled { "white" } else { "#6b7280" },
+                            if monitor.enabled { "#10b981" } else { "#d1d5db" }
+                        )
+                    >
+                        {if monitor.enabled { "ON" } else { "OFF" }}
+                    </button>
+                </div>
+            </div>
+            
+            // Status indicator
+            {if monitor.enabled && monitor.state == MonitorState::Running {
+                view! {
+                    <div>
+                        <div style="display: flex; align-items: center; gap: 0.375rem; margin-bottom: 0.625rem; padding: 0.375rem 0.5rem; background: #ecfdf5; border-radius: 6px;">
+                            <span style="color: #10b981; font-weight: 600; font-size: 0.625rem; animation: pulse 2s ease-in-out infinite;">"●"</span>
+                            <span style="color: #065f46; font-weight: 600; font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.3px;">"Live"</span>
+                        </div>
+                        
+                        <div style="color: #6b7280; font-size: 0.75rem; margin-bottom: 0.375rem;">
+                            <span style="font-weight: 600; color: #111827;">{format!("{}", monitor.stats.lines_processed)}</span>
+                            <span>" lines processed"</span>
+                        </div>
+                        
+                        <div style="color: #6b7280; font-size: 0.75rem; margin-bottom: 0.375rem;">
+                            <span style="font-weight: 600; color: #111827;">{format!("{}", monitor.stats.items_extracted)}</span>
+                            <span>" items extracted"</span>
+                        </div>
+                        
+                        {if let Some(last_activity) = &monitor.last_activity {
+                            view! {
+                                <div style="color: #9ca3af; font-size: 0.6875rem; margin-top: 0.5rem; padding-top: 0.5rem; border-top: 1px solid #f3f4f6;">
+                                    {format!("Last: {}", last_activity)}
+                                </div>
+                            }.into_any()
+                        } else {
+                            view! { <></> }.into_any()
+                        }}
+                    </div>
+                }.into_any()
+            } else if let MonitorState::Error { message } = &monitor.state {
+                view! {
+                    <div style="color: #ef4444; font-size: 0.75rem; padding: 0.5rem; background: #fee2e2; border-radius: 6px;">
+                        <div style="font-weight: 600; margin-bottom: 0.25rem;">"Error"</div>
+                        <div>{message.clone()}</div>
+                    </div>
+                }.into_any()
+            } else {
+                view! {
+                    <div style="color: #9ca3af; font-size: 0.75rem; font-style: italic;">
+                        "Inactive"
+                    </div>
+                }.into_any()
+            }}
+        </div>
+    }
+}
+
 
 #[component]
 fn HitCard(hit: Hit) -> impl IntoView {
@@ -484,6 +1202,20 @@ fn HitCard(hit: Hit) -> impl IntoView {
                     {source}
                 </span>
             </div>
+            
+            // Display log line if available
+            {if let Some(log_line) = &hit.log_line {
+                view! {
+                    <div style="margin-bottom: 0.875rem; padding: 0.75rem; background: #f9fafb; border-radius: 6px; border-left: 3px solid #e5e7eb;">
+                        <div style="font-size: 0.6875rem; color: #6b7280; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.375rem;">"Log Line"</div>
+                        <div style="font-family: 'SF Mono', 'Monaco', monospace; font-size: 0.75rem; color: #374151; word-break: break-all; line-height: 1.5;">
+                            {log_line.clone()}
+                        </div>
+                    </div>
+                }.into_any()
+            } else {
+                view! { <></> }.into_any()
+            }}
             
             // Display matched indicators
             {if !hit.matched_indicators.is_empty() {
@@ -566,11 +1298,168 @@ fn format_value(value: &serde_json::Value) -> String {
 }
 
 fn format_timestamp(timestamp: &str) -> String {
-    // Just show time portion for now
+    // Parse ISO 8601 timestamp and format as human-readable
+    // Example input: "2025-01-22T14:30:45.123Z"
+    // Example output: "Jan 22, 14:30:45"
+    
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(timestamp) {
+        // Format as "Mon DD, HH:MM:SS"
+        let local = dt.with_timezone(&chrono::Local);
+        return local.format("%b %d, %H:%M:%S").to_string();
+    }
+    
+    // Fallback to just showing time if parsing fails
     if let Some(time_part) = timestamp.split('T').nth(1) {
         if let Some(time_only) = time_part.split('.').next() {
             return time_only.to_string();
         }
     }
     timestamp.to_string()
+}
+
+#[component]
+fn ErrorModal(
+    message: ReadSignal<String>,
+    set_show: WriteSignal<bool>,
+) -> impl IntoView {
+    view! {
+        <div style="position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; z-index: 1000;">
+            <div style="background: white; border-radius: 12px; padding: 1.5rem; width: 90%; max-width: 500px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);">
+                <div style="display: flex; align-items: start; gap: 1rem; margin-bottom: 1.5rem;">
+                    <div style="font-size: 2rem; line-height: 1;">"⚠️"</div>
+                    <div style="flex: 1;">
+                        <h2 style="margin: 0 0 0.5rem 0; font-size: 1.25rem; font-weight: 700; color: #111827;">"Failed to Load Database"</h2>
+                        <p style="margin: 0; font-size: 0.875rem; color: #6b7280; line-height: 1.5;">
+                            "The selected file could not be loaded as a Matchy database."
+                        </p>
+                    </div>
+                    <button
+                        on:click=move |_| set_show.set(false)
+                        style="background: none; border: none; color: #9ca3af; cursor: pointer; font-size: 1.5rem; padding: 0.25rem; line-height: 1; border-radius: 4px; transition: all 0.15s; flex-shrink: 0;"
+                        onmouseover="this.style.color='#ef4444'; this.style.background='#fee2e2'"
+                        onmouseout="this.style.color='#9ca3af'; this.style.background='none'"
+                    >
+                        "×"
+                    </button>
+                </div>
+                
+                <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 1rem; margin-bottom: 1.5rem;">
+                    <div style="font-size: 0.75rem; font-weight: 600; color: #991b1b; margin-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.5px;">"Error Details"</div>
+                    <div style="font-family: 'SF Mono', 'Monaco', monospace; font-size: 0.8125rem; color: #dc2626; word-break: break-word; line-height: 1.5;">
+                        {move || message.get()}
+                    </div>
+                </div>
+                
+                <div style="display: flex; justify-content: flex-end;">
+                    <button
+                        on:click=move |_| set_show.set(false)
+                        style="padding: 0.625rem 1.25rem; background: #3b82f6; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 0.875rem; font-weight: 500; transition: all 0.2s;"
+                        onmouseover="this.style.background='#2563eb'"
+                        onmouseout="this.style.background='#3b82f6'"
+                    >
+                        "OK"
+                    </button>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn ExtractedValuesPanel(
+    show: ReadSignal<bool>,
+    set_show: WriteSignal<bool>,
+    items: ReadSignal<Vec<ExtractedValue>>,
+) -> impl IntoView {
+    view! {
+        <div style=move || format!(
+            "position: fixed; bottom: 0; left: 0; right: 0; background: white; border-top: 2px solid #e5e7eb; box-shadow: 0 -4px 12px rgba(0,0,0,0.1); transition: transform 0.3s ease-in-out; z-index: 950; {}",
+            if show.get() { "transform: translateY(0);" } else { "transform: translateY(100%);" }
+        )>
+            <div style="max-height: 60vh; display: flex; flex-direction: column;">
+                // Header
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 1rem 1.5rem; border-bottom: 1px solid #e5e7eb; background: #f9fafb;">
+                    <div>
+                        <h3 style="margin: 0; font-size: 1rem; font-weight: 700; color: #111827;">"Extracted Values"</h3>
+                        <p style="margin: 0.25rem 0 0 0; font-size: 0.75rem; color: #6b7280;">"IPs, domains, emails, hashes, and crypto addresses extracted from logs"</p>
+                    </div>
+                    <button
+                        on:click=move |_| set_show.set(false)
+                        style="background: none; border: none; color: #9ca3af; cursor: pointer; font-size: 1.5rem; padding: 0.25rem; line-height: 1; border-radius: 4px; transition: all 0.15s;"
+                        onmouseover="this.style.color='#ef4444'; this.style.background='#fee2e2'"
+                        onmouseout="this.style.color='#9ca3af'; this.style.background='none'"
+                    >
+                        "×"
+                    </button>
+                </div>
+                
+                // Content
+                <div style="flex: 1; overflow-y: auto; padding: 1rem 1.5rem;">
+                    {move || {
+                        let values = items.get();
+                        if values.is_empty() {
+                            view! {
+                                <div style="text-align: center; padding: 3rem 0; color: #9ca3af;">
+                                    <div style="font-size: 2.5rem; margin-bottom: 0.75rem;">"🔍"</div>
+                                    <p style="font-size: 0.875rem; margin: 0; font-weight: 500;">"No values extracted yet"</p>
+                                    <p style="font-size: 0.75rem; margin: 0.5rem 0 0 0; color: #d1d5db;">"Enable monitoring to see extracted values"</p>
+                                </div>
+                            }.into_any()
+                        } else {
+                            view! {
+                                <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 0.75rem;">
+                                    {values.into_iter().map(|item| {
+                                        let (icon, bg_color, border_color) = match item.item_type.as_str() {
+                                            "IPv4" => ("🌐", "#dbeafe", "#3b82f6"),
+                                            "IPv6" => ("🌐", "#dbeafe", "#3b82f6"),
+                                            "Domain" => ("🔗", "#e0e7ff", "#8b5cf6"),
+                                            "Email" => ("✉️", "#fef3c7", "#f59e0b"),
+                                            "MD5" | "SHA1" | "SHA256" | "SHA384" => ("#️⃣", "#fce7f3", "#ec4899"),
+                                            "Bitcoin" => ("₿", "#fef3c7", "#f59e0b"),
+                                            "Ethereum" => ("Ξ", "#ddd6fe", "#7c3aed"),
+                                            "Monero" => ("ɱ", "#e0e7ff", "#6366f1"),
+                                            _ => ("📄", "#f3f4f6", "#6b7280"),
+                                        };
+                                        
+                                        view! {
+                                            <div style=format!(
+                                                "padding: 0.75rem; background: {}; border-left: 3px solid {}; border-radius: 6px; font-size: 0.8125rem; transition: all 0.15s; {}",
+                                                bg_color,
+                                                border_color,
+                                                if item.matched { "box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3); border: 1px solid #10b981;" } else { "" }
+                                            )
+                                                onmouseover="this.style.transform='translateY(-2px)'; this.style.boxShadow='0 4px 12px rgba(0,0,0,0.1)'"
+                                                onmouseout="this.style.transform='translateY(0)'; this.style.boxShadow='none'">
+                                                <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
+                                                    <span style="font-size: 1.125rem;">{icon}</span>
+                                                    <span style=format!("padding: 0.125rem 0.5rem; background: white; border-radius: 4px; font-size: 0.6875rem; font-weight: 600; color: {};", border_color)>
+                                                        {item.item_type.clone()}
+                                                    </span>
+                                                    {if item.matched {
+                                                        view! {
+                                                            <span style="padding: 0.125rem 0.5rem; background: #10b981; color: white; border-radius: 4px; font-size: 0.6875rem; font-weight: 600; margin-left: auto;">
+                                                                "HIT"
+                                                            </span>
+                                                        }.into_any()
+                                                    } else {
+                                                        view! { <></> }.into_any()
+                                                    }}
+                                                </div>
+                                                <div style="font-family: 'SF Mono', 'Monaco', monospace; font-size: 0.8125rem; color: #111827; font-weight: 600; word-break: break-all; margin-bottom: 0.375rem;">
+                                                    {item.value.clone()}
+                                                </div>
+                                                <div style="font-size: 0.6875rem; color: #9ca3af;">
+                                                    {format_timestamp(&item.timestamp)}
+                                                </div>
+                                            </div>
+                                        }
+                                    }).collect::<Vec<_>>()}
+                                </div>
+                            }.into_any()
+                        }
+                    }}
+                </div>
+            </div>
+        </div>
+    }
 }

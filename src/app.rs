@@ -122,13 +122,6 @@ struct Hit {
 }
 
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ExtractedValue {
-    value: String,
-    item_type: String,
-    timestamp: String,
-    matched: bool,
-}
 
 // New monitor structures matching backend
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -167,6 +160,7 @@ enum MonitorConfigInfo {
     LogFile { path: String },
     ApiEndpoint { url: String, interval_secs: u64 },
     FilesystemScan { path: String, recursive: bool },
+    ZeekPacketCapture { interface: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -176,6 +170,7 @@ enum MonitorTypeInfo {
     LogFile,
     ApiEndpoint,
     FilesystemScan,
+    ZeekPacketCapture,
 }
 
 #[component]
@@ -191,8 +186,8 @@ pub fn App() -> impl IntoView {
     let (selected_monitor_type, set_selected_monitor_type) = signal("log_file".to_string());
     let (monitor_name, set_monitor_name) = signal(String::new());
     let (log_file_path, set_log_file_path) = signal(String::new());
-    let (show_extracted_panel, set_show_extracted_panel) = signal(false);
-    let (extracted_items, set_extracted_items) = signal::<Vec<ExtractedValue>>(Vec::new());
+    let (network_interfaces, set_network_interfaces) = signal::<Vec<String>>(Vec::new());
+    let (selected_interface, set_selected_interface) = signal(String::new());
     let (show_error_modal, set_show_error_modal) = signal(false);
     let (error_message, set_error_message) = signal(String::new());
     let (databases_expanded, set_databases_expanded) = signal(load_collapse_state("databases_expanded", true));
@@ -253,36 +248,6 @@ pub fn App() -> impl IntoView {
         });
     });
     
-    // Listen for extracted values
-    Effect::new(move |_| {
-        spawn_local(async move {
-            let closure = Closure::wrap(Box::new(move |event: JsValue| {
-                match js_sys::Reflect::get(&event, &"payload".into()) {
-                    Ok(payload) => {
-                        match serde_wasm_bindgen::from_value::<ExtractedValue>(payload) {
-                            Ok(extracted) => {
-                                set_extracted_items.update(|items| {
-                                    items.insert(0, extracted);
-                                    if items.len() > 200 {
-                                        items.truncate(200);
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                error(&format!("Failed to parse extracted value: {:?}", e));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error(&format!("Failed to get extracted payload: {:?}", e));
-                    }
-                }
-            }) as Box<dyn FnMut(JsValue)>);
-            
-            let _ = listen("extracted-value", closure.as_ref()).await;
-            closure.forget();
-        });
-    });
     
     // Listen for database updates
     Effect::new(move |_| {
@@ -619,9 +584,13 @@ pub fn App() -> impl IntoView {
                                                     
                                                     // Set config based on monitor config
                                                     match &monitor_for_edit.config {
-                                                        MonitorConfigInfo::LogFile { path } => {
+                        MonitorConfigInfo::LogFile { path } => {
                                                             set_selected_monitor_type.set("log_file".to_string());
                                                             set_log_file_path.set(path.clone());
+                                                        }
+                                                        MonitorConfigInfo::ZeekPacketCapture { interface } => {
+                                                            set_selected_monitor_type.set("zeek_packet_capture".to_string());
+                                                            set_selected_interface.set(interface.clone());
                                                         }
                                                         _ => {}
                                                     }
@@ -692,6 +661,10 @@ pub fn App() -> impl IntoView {
                             set_monitor_name=set_monitor_name
                             log_file_path=log_file_path
                             set_log_file_path=set_log_file_path
+                            network_interfaces=network_interfaces
+                            set_network_interfaces=set_network_interfaces
+                            selected_interface=selected_interface
+                            set_selected_interface=set_selected_interface
                         />
                     }.into_any()
                 } else {
@@ -734,26 +707,6 @@ pub fn App() -> impl IntoView {
                 }
             }}
             
-            // Extracted Values Panel
-            <ExtractedValuesPanel 
-                show=show_extracted_panel
-                set_show=set_show_extracted_panel
-                items=extracted_items
-            />
-            
-            // Floating toggle button for extracted values panel
-            <button
-                on:click=move |_| set_show_extracted_panel.update(|show| *show = !*show)
-                style=move || format!(
-                    "position: fixed; bottom: 2rem; right: 2rem; width: 3.5rem; height: 3.5rem; background: {}; color: white; border: none; border-radius: 50%; cursor: pointer; font-size: 1.25rem; font-weight: 600; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4); transition: all 0.2s; z-index: 900; display: flex; align-items: center; justify-content: center;",
-                    if show_extracted_panel.get() { "#10b981" } else { "#3b82f6" }
-                )
-                onmouseover="this.style.transform='scale(1.1)'; this.style.boxShadow='0 6px 16px rgba(59, 130, 246, 0.5)'"
-                onmouseout="this.style.transform='scale(1)'; this.style.boxShadow='0 4px 12px rgba(59, 130, 246, 0.4)'"
-                title="Toggle Extracted Values"
-            >
-                {move || if show_extracted_panel.get() { "✓" } else { "📊" }}
-            </button>
         </main>
     }
 }
@@ -768,7 +721,26 @@ fn AddMonitorModal(
     set_monitor_name: WriteSignal<String>,
     log_file_path: ReadSignal<String>,
     set_log_file_path: WriteSignal<String>,
+    network_interfaces: ReadSignal<Vec<String>>,
+    set_network_interfaces: WriteSignal<Vec<String>>,
+    selected_interface: ReadSignal<String>,
+    set_selected_interface: WriteSignal<String>,
 ) -> impl IntoView {
+    // Load network interfaces when modal opens
+    Effect::new(move |_| {
+        spawn_local(async move {
+            if let Ok(res) = invoke("list_network_interfaces", JsValue::NULL).await {
+                if let Ok(ifaces) = serde_wasm_bindgen::from_value::<Vec<String>>(res) {
+                    set_network_interfaces.set(ifaces.clone());
+                    // Set default interface if available
+                    if !ifaces.is_empty() && selected_interface.get_untracked().is_empty() {
+                        set_selected_interface.set(ifaces[0].clone());
+                    }
+                }
+            }
+        });
+    });
+    
     let pick_log_file = move |_| {
         spawn_local(async move {
             if let Ok(res) = invoke("pick_any_file", JsValue::NULL).await {
@@ -797,6 +769,15 @@ fn AddMonitorModal(
                     "type": "log_file",
                     "path": file_path
                 })
+            } else if mon_type == "zeek_packet_capture" {
+                let interface = selected_interface.get_untracked();
+                if interface.is_empty() {
+                    return;
+                }
+                serde_json::json!({
+                    "type": "zeek_packet_capture",
+                    "interface": interface
+                })
             } else {
                 return;
             };
@@ -810,6 +791,7 @@ fn AddMonitorModal(
                 // Reset form and close modal
                 set_monitor_name.set(String::new());
                 set_log_file_path.set(String::new());
+                set_selected_interface.set(String::new());
                 set_show.set(false);
             }
         });
@@ -852,12 +834,14 @@ fn AddMonitorModal(
                         style="width: 100%; padding: 0.625rem; border: 1.5px solid #e5e7eb; border-radius: 8px; font-size: 0.875rem; background: white; cursor: pointer;"
                     >
                         <option value="log_file">"📄 Log File"</option>
+                        <option value="zeek_packet_capture">"📡 Zeek Packet Capture"</option>
                     </select>
                 </div>
                 
                 // Log File Configuration
                 {move || {
-                    if selected_type.get() == "log_file" {
+                    let mon_type = selected_type.get();
+                    if mon_type == "log_file" {
                         view! {
                             <div style="margin-bottom: 1.25rem; padding: 1rem; background: #f9fafb; border-radius: 8px;">
                                 <label style="display: block; font-size: 0.875rem; font-weight: 600; color: #374151; margin-bottom: 0.5rem;">"Log File Path"</label>
@@ -877,6 +861,29 @@ fn AddMonitorModal(
                                         "Browse"
                                     </button>
                                 </div>
+                            </div>
+                        }.into_any()
+                    } else if mon_type == "zeek_packet_capture" {
+                        view! {
+                            <div style="margin-bottom: 1.25rem; padding: 1rem; background: #fff7ed; border-radius: 8px; border: 1px solid #fed7aa;">
+                                <label style="display: block; font-size: 0.875rem; font-weight: 600; color: #374151; margin-bottom: 0.5rem;">"Network Interface"</label>
+                                <select
+                                    on:change=move |ev| set_selected_interface.set(event_target_value(&ev))
+                                    prop:value=move || selected_interface.get()
+                                    style="width: 100%; padding: 0.625rem; border: 1.5px solid #e5e7eb; border-radius: 8px; font-size: 0.875rem; background: white; cursor: pointer; font-family: 'SF Mono', monospace;"
+                                >
+                                    {move || {
+                                        network_interfaces.get().into_iter().map(|iface| {
+                                            let iface_clone = iface.clone();
+                                            view! {
+                                                <option value={iface}>{iface_clone}</option>
+                                            }
+                                        }).collect::<Vec<_>>()
+                                    }}
+                                </select>
+                                <p style="margin: 0.75rem 0 0 0; font-size: 0.75rem; color: #92400e; line-height: 1.4;">
+                                    "⚠️ Requires administrator password. Zeek must be installed (brew install zeek)."
+                                </p>
                             </div>
                         }.into_any()
                     } else {
@@ -1074,6 +1081,7 @@ fn MonitorCardNew(
         MonitorTypeInfo::LogFile => "📄",
         MonitorTypeInfo::ApiEndpoint => "🌐",
         MonitorTypeInfo::FilesystemScan => "🔍",
+        MonitorTypeInfo::ZeekPacketCapture => "📡",
     };
     
     view! {
@@ -1365,101 +1373,3 @@ fn ErrorModal(
     }
 }
 
-#[component]
-fn ExtractedValuesPanel(
-    show: ReadSignal<bool>,
-    set_show: WriteSignal<bool>,
-    items: ReadSignal<Vec<ExtractedValue>>,
-) -> impl IntoView {
-    view! {
-        <div style=move || format!(
-            "position: fixed; bottom: 0; left: 0; right: 0; background: white; border-top: 2px solid #e5e7eb; box-shadow: 0 -4px 12px rgba(0,0,0,0.1); transition: transform 0.3s ease-in-out; z-index: 950; {}",
-            if show.get() { "transform: translateY(0);" } else { "transform: translateY(100%);" }
-        )>
-            <div style="max-height: 60vh; display: flex; flex-direction: column;">
-                // Header
-                <div style="display: flex; justify-content: space-between; align-items: center; padding: 1rem 1.5rem; border-bottom: 1px solid #e5e7eb; background: #f9fafb;">
-                    <div>
-                        <h3 style="margin: 0; font-size: 1rem; font-weight: 700; color: #111827;">"Extracted Values"</h3>
-                        <p style="margin: 0.25rem 0 0 0; font-size: 0.75rem; color: #6b7280;">"IPs, domains, emails, hashes, and crypto addresses extracted from logs"</p>
-                    </div>
-                    <button
-                        on:click=move |_| set_show.set(false)
-                        style="background: none; border: none; color: #9ca3af; cursor: pointer; font-size: 1.5rem; padding: 0.25rem; line-height: 1; border-radius: 4px; transition: all 0.15s;"
-                        onmouseover="this.style.color='#ef4444'; this.style.background='#fee2e2'"
-                        onmouseout="this.style.color='#9ca3af'; this.style.background='none'"
-                    >
-                        "×"
-                    </button>
-                </div>
-                
-                // Content
-                <div style="flex: 1; overflow-y: auto; padding: 1rem 1.5rem;">
-                    {move || {
-                        let values = items.get();
-                        if values.is_empty() {
-                            view! {
-                                <div style="text-align: center; padding: 3rem 0; color: #9ca3af;">
-                                    <div style="font-size: 2.5rem; margin-bottom: 0.75rem;">"🔍"</div>
-                                    <p style="font-size: 0.875rem; margin: 0; font-weight: 500;">"No values extracted yet"</p>
-                                    <p style="font-size: 0.75rem; margin: 0.5rem 0 0 0; color: #d1d5db;">"Enable monitoring to see extracted values"</p>
-                                </div>
-                            }.into_any()
-                        } else {
-                            view! {
-                                <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 0.75rem;">
-                                    {values.into_iter().map(|item| {
-                                        let (icon, bg_color, border_color) = match item.item_type.as_str() {
-                                            "IPv4" => ("🌐", "#dbeafe", "#3b82f6"),
-                                            "IPv6" => ("🌐", "#dbeafe", "#3b82f6"),
-                                            "Domain" => ("🔗", "#e0e7ff", "#8b5cf6"),
-                                            "Email" => ("✉️", "#fef3c7", "#f59e0b"),
-                                            "MD5" | "SHA1" | "SHA256" | "SHA384" => ("#️⃣", "#fce7f3", "#ec4899"),
-                                            "Bitcoin" => ("₿", "#fef3c7", "#f59e0b"),
-                                            "Ethereum" => ("Ξ", "#ddd6fe", "#7c3aed"),
-                                            "Monero" => ("ɱ", "#e0e7ff", "#6366f1"),
-                                            _ => ("📄", "#f3f4f6", "#6b7280"),
-                                        };
-                                        
-                                        view! {
-                                            <div style=format!(
-                                                "padding: 0.75rem; background: {}; border-left: 3px solid {}; border-radius: 6px; font-size: 0.8125rem; transition: all 0.15s; {}",
-                                                bg_color,
-                                                border_color,
-                                                if item.matched { "box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3); border: 1px solid #10b981;" } else { "" }
-                                            )
-                                                onmouseover="this.style.transform='translateY(-2px)'; this.style.boxShadow='0 4px 12px rgba(0,0,0,0.1)'"
-                                                onmouseout="this.style.transform='translateY(0)'; this.style.boxShadow='none'">
-                                                <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
-                                                    <span style="font-size: 1.125rem;">{icon}</span>
-                                                    <span style=format!("padding: 0.125rem 0.5rem; background: white; border-radius: 4px; font-size: 0.6875rem; font-weight: 600; color: {};", border_color)>
-                                                        {item.item_type.clone()}
-                                                    </span>
-                                                    {if item.matched {
-                                                        view! {
-                                                            <span style="padding: 0.125rem 0.5rem; background: #10b981; color: white; border-radius: 4px; font-size: 0.6875rem; font-weight: 600; margin-left: auto;">
-                                                                "HIT"
-                                                            </span>
-                                                        }.into_any()
-                                                    } else {
-                                                        view! { <></> }.into_any()
-                                                    }}
-                                                </div>
-                                                <div style="font-family: 'SF Mono', 'Monaco', monospace; font-size: 0.8125rem; color: #111827; font-weight: 600; word-break: break-all; margin-bottom: 0.375rem;">
-                                                    {item.value.clone()}
-                                                </div>
-                                                <div style="font-size: 0.6875rem; color: #9ca3af;">
-                                                    {format_timestamp(&item.timestamp)}
-                                                </div>
-                                            </div>
-                                        }
-                                    }).collect::<Vec<_>>()}
-                                </div>
-                            }.into_any()
-                        }
-                    }}
-                </div>
-            </div>
-        </div>
-    }
-}

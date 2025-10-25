@@ -36,6 +36,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": [
+      "icons/tray-icon.png"
+    ],
     "macOS": {
       "entitlements": "Entitlements.plist"
     }

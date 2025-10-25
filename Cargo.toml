@@ -1,5 +1,5 @@
 [package]
-name = "matchy-app-ui"
+name = "matchy-monitor"
 version = "0.1.0"
 edition = "2021"
 
@@ -19,3 +19,7 @@ chrono = { version = "0.4", features = ["wasmbind"] }
 
 [workspace]
 members = ["src-tauri"]
+
+# Uncomment during local development to use local matchy crate:
+# [patch.crates-io]
+# matchy = { path = "../matchy" }

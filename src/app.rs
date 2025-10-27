@@ -1,20 +1,20 @@
 use leptos::task::spawn_local;
-use web_sys;
 use leptos::{ev::SubmitEvent, prelude::*};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
+use web_sys;
 
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], catch)]
     async fn invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
-    
+
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "event"])]
     async fn listen(event: &str, handler: &JsValue) -> JsValue;
-    
+
     #[wasm_bindgen(js_namespace = console)]
     fn log(s: &str);
-    
+
     #[wasm_bindgen(js_namespace = console)]
     fn error(s: &str);
 }
@@ -66,12 +66,10 @@ fn load_hits_from_storage() -> Vec<Hit> {
 fn save_hits_to_storage(hits: &[Hit]) {
     if let Some(storage) = get_local_storage() {
         match serde_json::to_string(hits) {
-            Ok(json) => {
-                match storage.set_item("hits", &json) {
-                    Ok(_) => log(&format!("Saved {} hits to storage", hits.len())),
-                    Err(e) => error(&format!("Failed to save hits to storage: {:?}", e)),
-                }
-            }
+            Ok(json) => match storage.set_item("hits", &json) {
+                Ok(_) => log(&format!("Saved {} hits to storage", hits.len())),
+                Err(e) => error(&format!("Failed to save hits to storage: {:?}", e)),
+            },
             Err(e) => error(&format!("Failed to serialize hits: {:?}", e)),
         }
     } else {
@@ -120,8 +118,6 @@ struct Hit {
     data: Vec<serde_json::Value>,
     log_line: Option<String>,
 }
-
-
 
 // New monitor structures matching backend
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -190,9 +186,11 @@ pub fn App() -> impl IntoView {
     let (selected_interface, set_selected_interface) = signal(String::new());
     let (show_error_modal, set_show_error_modal) = signal(false);
     let (error_message, set_error_message) = signal(String::new());
-    let (databases_expanded, set_databases_expanded) = signal(load_collapse_state("databases_expanded", true));
-    let (monitors_expanded, set_monitors_expanded) = signal(load_collapse_state("monitors_expanded", true));
-    
+    let (databases_expanded, set_databases_expanded) =
+        signal(load_collapse_state("databases_expanded", true));
+    let (monitors_expanded, set_monitors_expanded) =
+        signal(load_collapse_state("monitors_expanded", true));
+
     // Load databases and monitors on mount
     Effect::new(move |_| {
         spawn_local(async move {
@@ -202,7 +200,7 @@ pub fn App() -> impl IntoView {
                 }
             }
         });
-        
+
         spawn_local(async move {
             if let Ok(res) = invoke("list_monitors", JsValue::NULL).await {
                 if let Ok(mons) = serde_wasm_bindgen::from_value::<Vec<Monitor>>(res) {
@@ -211,7 +209,7 @@ pub fn App() -> impl IntoView {
             }
         });
     });
-    
+
     // Listen for hit events
     Effect::new(move |_| {
         spawn_local(async move {
@@ -242,13 +240,12 @@ pub fn App() -> impl IntoView {
                     }
                 }
             }) as Box<dyn FnMut(JsValue)>);
-            
+
             let _ = listen("hit", closure.as_ref()).await;
             closure.forget();
         });
     });
-    
-    
+
     // Listen for database updates
     Effect::new(move |_| {
         spawn_local(async move {
@@ -262,12 +259,12 @@ pub fn App() -> impl IntoView {
                     }
                 });
             }) as Box<dyn FnMut(JsValue)>);
-            
+
             let _ = listen("databases-updated", closure.as_ref()).await;
             closure.forget();
         });
     });
-    
+
     // Listen for monitor updates
     Effect::new(move |_| {
         spawn_local(async move {
@@ -281,20 +278,21 @@ pub fn App() -> impl IntoView {
                     }
                 });
             }) as Box<dyn FnMut(JsValue)>);
-            
+
             let _ = listen("monitors-updated", closure.as_ref()).await;
             closure.forget();
         });
     });
-    
+
     let add_database = move |_| {
         spawn_local(async move {
             match invoke("pick_file", JsValue::NULL).await {
                 Ok(res) => {
                     if let Ok(Some(path)) = serde_wasm_bindgen::from_value::<Option<String>>(res) {
                         let path_clone = path.clone();
-                        let args = serde_wasm_bindgen::to_value(&serde_json::json!({"path": path})).unwrap();
-                        
+                        let args = serde_wasm_bindgen::to_value(&serde_json::json!({"path": path}))
+                            .unwrap();
+
                         // Now invoke can fail properly with Result
                         match invoke("load_database", args).await {
                             Ok(result_value) => {
@@ -304,7 +302,8 @@ pub fn App() -> impl IntoView {
                                         set_databases.update(|dbs| dbs.push(info));
                                     }
                                     Err(e) => {
-                                        let error_msg = format!("Failed to parse database info: {:?}", e);
+                                        let error_msg =
+                                            format!("Failed to parse database info: {:?}", e);
                                         error(&error_msg);
                                         set_error_message.set(error_msg);
                                         set_show_error_modal.set(true);
@@ -317,9 +316,12 @@ pub fn App() -> impl IntoView {
                                     js_sys::Reflect::get(&err, &"message".into())
                                         .ok()
                                         .and_then(|v| v.as_string())
-                                        .unwrap_or_else(|| "Unknown error occurred while loading database".to_string())
+                                        .unwrap_or_else(|| {
+                                            "Unknown error occurred while loading database"
+                                                .to_string()
+                                        })
                                 });
-                                
+
                                 error(&format!("Failed to load {}: {}", path_clone, error_msg));
                                 set_error_message.set(error_msg);
                                 set_show_error_modal.set(true);
@@ -333,7 +335,7 @@ pub fn App() -> impl IntoView {
             }
         });
     };
-    
+
     let remove_database = move |id: String| {
         spawn_local(async move {
             let args = serde_wasm_bindgen::to_value(&serde_json::json!({"id": id})).unwrap();
@@ -342,12 +344,14 @@ pub fn App() -> impl IntoView {
             }
         });
     };
-    
+
     let _run_query = move |_ev: SubmitEvent| {
         _ev.prevent_default();
         let q = query.get_untracked();
-        if q.is_empty() { return; }
-        
+        if q.is_empty() {
+            return;
+        }
+
         spawn_local(async move {
             let args = serde_wasm_bindgen::to_value(&serde_json::json!({"query": q})).unwrap();
             if let Ok(res) = invoke("query_databases", args).await {
@@ -372,14 +376,14 @@ pub fn App() -> impl IntoView {
             }
         });
     };
-    
+
     view! {
         <main style="display: flex; flex-direction: column; height: 100vh; background: #f8f9fa; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; position: relative;">
-            // Drag region header  
+            // Drag region header
             <div class="titlebar" style="height: 32px; background: #f9fafb; border-bottom: 1px solid #e5e7eb; flex-shrink: 0;">
                 <div data-tauri-drag-region style="width: 100%; height: 100%;"></div>
             </div>
-            
+
             <div style="display: flex; flex: 1; overflow: hidden;">
                 // Sidebar - Database List and Monitors
                 <div style="width: 280px; background: #f9fafb; border-right: 1px solid #e5e7eb; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1.5rem;">
@@ -437,7 +441,7 @@ pub fn App() -> impl IntoView {
                                             .and_then(|n| n.to_str())
                                             .unwrap_or(&db.path)
                                             .to_string();
-                                        
+
                                         view! {
                                             <div style="padding: 0.625rem; background: white; border-radius: 6px; font-size: 0.75rem; transition: all 0.2s; border: 1px solid #e5e7eb; box-shadow: 0 1px 2px rgba(0,0,0,0.02);"
                                                  onmouseover="this.style.boxShadow='0 2px 8px rgba(0,0,0,0.08)'; this.style.borderColor='#d1d5db'"
@@ -455,7 +459,7 @@ pub fn App() -> impl IntoView {
                                                         "×"
                                                     </button>
                                                 </div>
-                                                
+
                                                 // Show description if available
                                                 {db.description.as_ref().map(|desc| {
                                                     view! {
@@ -466,14 +470,14 @@ pub fn App() -> impl IntoView {
                                                         </div>
                                                     }.into_any()
                                                 }).unwrap_or_else(|| view! { <></> }.into_any())}
-                                                
+
                                                 // Show build date if available
                                                 {db.build_epoch.map(|epoch| {
                                                     // Format Unix timestamp to human-readable date
                                                     let date = chrono::DateTime::from_timestamp(epoch as i64, 0)
                                                         .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
                                                         .unwrap_or_else(|| "Unknown date".to_string());
-                                                    
+
                                                     view! {
                                                         <div style="margin-bottom: 0.5rem; color: #6b7280; font-size: 0.6875rem;">
                                                             <span style="font-weight: 500;">"Built: "</span>
@@ -481,7 +485,7 @@ pub fn App() -> impl IntoView {
                                                         </div>
                                                     }.into_any()
                                                 }).unwrap_or_else(|| view! { <></> }.into_any())}
-                                                
+
                                                 // Compact stats in two rows
                                                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.25rem;">
                                                     <span style="color: #6b7280; font-size: 0.6875rem;">{db.size_human.clone()}</span>
@@ -490,7 +494,7 @@ pub fn App() -> impl IntoView {
                                                         <span>" indicators"</span>
                                                     </span>
                                                 </div>
-                                                
+
                                                 <div style="display: flex; justify-content: space-between; align-items: center; color: #6b7280; font-size: 0.6875rem;">
                                                     <span>{format!("{}/{}", db.stats.queries_with_match, db.stats.total_queries)}</span>
                                                     <span style="color: #3b82f6; font-weight: 600;">{format!("{:.0}%", db.stats.match_rate * 100.0)}</span>
@@ -504,7 +508,7 @@ pub fn App() -> impl IntoView {
                     }}
                     </div>
                     </div>
-                    
+
                     // Monitors section
                     <div>
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
@@ -532,7 +536,7 @@ pub fn App() -> impl IntoView {
                                 </button>
                             </div>
                         </div>
-                        
+
                     <div style=move || format!(
                         "overflow: hidden; transition: max-height 0.33s ease-in-out; {}",
                         if monitors_expanded.get() {
@@ -559,7 +563,7 @@ pub fn App() -> impl IntoView {
                                             let monitor_id_for_edit = monitor.id.clone();
                                             let monitor_for_edit = monitor.clone();
                                             let is_system = monitor.monitor_type == MonitorTypeInfo::SystemLogs;
-                                            
+
                                             let toggle_fn = move |_| {
                                                 let id = monitor_id.clone();
                                                 spawn_local(async move {
@@ -567,7 +571,7 @@ pub fn App() -> impl IntoView {
                                                     let _ = invoke("toggle_monitor", args).await.ok();
                                                 });
                                             };
-                                            
+
                                             let remove_fn = move |_| {
                                                 let id = monitor_id_for_remove.clone();
                                                 spawn_local(async move {
@@ -575,13 +579,13 @@ pub fn App() -> impl IntoView {
                                                     let _ = invoke("remove_monitor", args).await.ok();
                                                 });
                                             };
-                                            
+
                                             let edit_fn = move |_| {
                                                 if !is_system && !monitor_for_edit.enabled {
                                                     // Populate edit modal with current values
                                                     set_edit_monitor_id.set(monitor_id_for_edit.clone());
                                                     set_monitor_name.set(monitor_for_edit.name.clone());
-                                                    
+
                                                     // Set config based on monitor config
                                                     match &monitor_for_edit.config {
                         MonitorConfigInfo::LogFile { path } => {
@@ -594,14 +598,14 @@ pub fn App() -> impl IntoView {
                                                         }
                                                         _ => {}
                                                     }
-                                                    
+
                                                     set_show_edit_modal.set(true);
                                                 }
                                             };
-                                            
+
                                             view! {
-                                                <MonitorCardNew 
-                                                    monitor=monitor 
+                                                <MonitorCardNew
+                                                    monitor=monitor
                                                     on_toggle=toggle_fn
                                                     on_remove=remove_fn
                                                     on_edit=edit_fn
@@ -616,13 +620,13 @@ pub fn App() -> impl IntoView {
                     </div>
                     </div>
                 </div>
-                
+
                 // Main Content - Hit Feed
                 <div style="flex: 1; overflow-y: auto; padding: 1.5rem 2rem; background: white;">
                     <h2 style="margin: 0 0 1.25rem 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.8px; color: #6b7280; font-weight: 700;">
                         "Intelligence Hits"
                     </h2>
-                    
+
                     {move || {
                         let hit_list = hits.get();
                         if hit_list.is_empty() {
@@ -647,7 +651,7 @@ pub fn App() -> impl IntoView {
                     }}
                 </div>
             </div>
-            
+
             // Add Monitor Modal
             {move || {
                 if show_add_modal.get() {
@@ -671,7 +675,7 @@ pub fn App() -> impl IntoView {
                     view! { <></> }.into_any()
                 }
             }}
-            
+
             // Edit Monitor Modal
             {move || {
                 if show_edit_modal.get() {
@@ -692,7 +696,7 @@ pub fn App() -> impl IntoView {
                     view! { <></> }.into_any()
                 }
             }}
-            
+
             // Error Modal
             {move || {
                 if show_error_modal.get() {
@@ -706,7 +710,7 @@ pub fn App() -> impl IntoView {
                     view! { <></> }.into_any()
                 }
             }}
-            
+
         </main>
     }
 }
@@ -740,7 +744,7 @@ fn AddMonitorModal(
             }
         });
     });
-    
+
     let pick_log_file = move |_| {
         spawn_local(async move {
             if let Ok(res) = invoke("pick_any_file", JsValue::NULL).await {
@@ -750,16 +754,16 @@ fn AddMonitorModal(
             }
         });
     };
-    
+
     let create_monitor = move |_: leptos::ev::MouseEvent| {
         let mon_type = selected_type.get_untracked();
         let name = monitor_name.get_untracked();
         let file_path = log_file_path.get_untracked();
-        
+
         if name.is_empty() {
             return;
         }
-        
+
         spawn_local(async move {
             let config = if mon_type == "log_file" {
                 if file_path.is_empty() {
@@ -781,12 +785,13 @@ fn AddMonitorModal(
             } else {
                 return;
             };
-            
+
             let args = serde_wasm_bindgen::to_value(&serde_json::json!({
                 "name": name,
                 "config": config
-            })).unwrap();
-            
+            }))
+            .unwrap();
+
             if invoke("add_monitor", args).await.is_ok() {
                 // Reset form and close modal
                 set_monitor_name.set(String::new());
@@ -796,7 +801,7 @@ fn AddMonitorModal(
             }
         });
     };
-    
+
     view! {
         <div style="position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; z-index: 1000;">
             <div style="background: white; border-radius: 12px; padding: 1.5rem; width: 90%; max-width: 500px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);">
@@ -811,7 +816,7 @@ fn AddMonitorModal(
                         "×"
                     </button>
                 </div>
-                
+
                 // Monitor Name
                 <div style="margin-bottom: 1.25rem;">
                     <label style="display: block; font-size: 0.875rem; font-weight: 600; color: #374151; margin-bottom: 0.5rem;">"Monitor Name"</label>
@@ -824,7 +829,7 @@ fn AddMonitorModal(
                         onblur="this.style.borderColor='#e5e7eb'; this.style.boxShadow='none'"
                     />
                 </div>
-                
+
                 // Monitor Type
                 <div style="margin-bottom: 1.25rem;">
                     <label style="display: block; font-size: 0.875rem; font-weight: 600; color: #374151; margin-bottom: 0.5rem;">"Monitor Type"</label>
@@ -837,7 +842,7 @@ fn AddMonitorModal(
                         <option value="zeek_packet_capture">"📡 Zeek Packet Capture"</option>
                     </select>
                 </div>
-                
+
                 // Log File Configuration
                 {move || {
                     let mon_type = selected_type.get();
@@ -890,7 +895,7 @@ fn AddMonitorModal(
                         view! { <></> }.into_any()
                     }
                 }}
-                
+
                 // Actions
                 <div style="display: flex; gap: 0.75rem; justify-content: flex-end; margin-top: 1.5rem;">
                     <button
@@ -936,17 +941,17 @@ fn EditMonitorModal(
             }
         });
     };
-    
+
     let update_monitor = move |_: leptos::ev::MouseEvent| {
         let id = monitor_id.get_untracked();
         let mon_type = selected_type.get_untracked();
         let name = monitor_name.get_untracked();
         let file_path = log_file_path.get_untracked();
-        
+
         if name.is_empty() {
             return;
         }
-        
+
         spawn_local(async move {
             let config = if mon_type == "log_file" {
                 if file_path.is_empty() {
@@ -959,13 +964,14 @@ fn EditMonitorModal(
             } else {
                 return;
             };
-            
+
             let args = serde_wasm_bindgen::to_value(&serde_json::json!({
                 "id": id,
                 "name": name,
                 "config": config
-            })).unwrap();
-            
+            }))
+            .unwrap();
+
             if invoke("update_monitor", args).await.is_ok() {
                 // Reset form and close modal
                 set_monitor_name.set(String::new());
@@ -974,7 +980,7 @@ fn EditMonitorModal(
             }
         });
     };
-    
+
     view! {
         <div style="position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; z-index: 1000;">
             <div style="background: white; border-radius: 12px; padding: 1.5rem; width: 90%; max-width: 500px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);">
@@ -989,7 +995,7 @@ fn EditMonitorModal(
                         "×"
                     </button>
                 </div>
-                
+
                 // Monitor Name
                 <div style="margin-bottom: 1.25rem;">
                     <label style="display: block; font-size: 0.875rem; font-weight: 600; color: #374151; margin-bottom: 0.5rem;">"Monitor Name"</label>
@@ -1002,7 +1008,7 @@ fn EditMonitorModal(
                         onblur="this.style.borderColor='#e5e7eb'; this.style.boxShadow='none'"
                     />
                 </div>
-                
+
                 // Monitor Type (read-only for now)
                 <div style="margin-bottom: 1.25rem;">
                     <label style="display: block; font-size: 0.875rem; font-weight: 600; color: #374151; margin-bottom: 0.5rem;">"Monitor Type"</label>
@@ -1014,7 +1020,7 @@ fn EditMonitorModal(
                         <option value="log_file">"📄 Log File"</option>
                     </select>
                 </div>
-                
+
                 // Log File Configuration
                 {move || {
                     if selected_type.get() == "log_file" {
@@ -1043,7 +1049,7 @@ fn EditMonitorModal(
                         view! { <></> }.into_any()
                     }
                 }}
-                
+
                 // Actions
                 <div style="display: flex; gap: 0.75rem; justify-content: flex-end; margin-top: 1.5rem;">
                     <button
@@ -1083,13 +1089,13 @@ fn MonitorCardNew(
         MonitorTypeInfo::FilesystemScan => "🔍",
         MonitorTypeInfo::ZeekPacketCapture => "📡",
     };
-    
+
     view! {
         <div style="padding: 0.875rem; background: white; border-radius: 8px; font-size: 0.8125rem; transition: all 0.2s; border: 1px solid #e5e7eb; box-shadow: 0 1px 2px rgba(0,0,0,0.02); cursor: pointer;"
              onmouseover="this.style.boxShadow='0 2px 8px rgba(0,0,0,0.08)'; this.style.borderColor='#d1d5db'"
              onmouseout="this.style.boxShadow='0 1px 2px rgba(0,0,0,0.02)'; this.style.borderColor='#e5e7eb'"
              on:dblclick=on_edit>
-            
+
             // Header with name, toggle, and remove button
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
                 <div style="display: flex; align-items: center; gap: 0.5rem; flex: 1; min-width: 0;">
@@ -1124,7 +1130,7 @@ fn MonitorCardNew(
                     </button>
                 </div>
             </div>
-            
+
             // Status indicator
             {if monitor.enabled && monitor.state == MonitorState::Running {
                 view! {
@@ -1133,17 +1139,17 @@ fn MonitorCardNew(
                             <span style="color: #10b981; font-weight: 600; font-size: 0.625rem; animation: pulse 2s ease-in-out infinite;">"●"</span>
                             <span style="color: #065f46; font-weight: 600; font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.3px;">"Live"</span>
                         </div>
-                        
+
                         <div style="color: #6b7280; font-size: 0.75rem; margin-bottom: 0.375rem;">
                             <span style="font-weight: 600; color: #111827;">{format!("{}", monitor.stats.lines_processed)}</span>
                             <span>" lines processed"</span>
                         </div>
-                        
+
                         <div style="color: #6b7280; font-size: 0.75rem; margin-bottom: 0.375rem;">
                             <span style="font-weight: 600; color: #111827;">{format!("{}", monitor.stats.items_extracted)}</span>
                             <span>" items extracted"</span>
                         </div>
-                        
+
                         {if let Some(last_activity) = &monitor.last_activity {
                             view! {
                                 <div style="color: #9ca3af; font-size: 0.6875rem; margin-top: 0.5rem; padding-top: 0.5rem; border-top: 1px solid #f3f4f6;">
@@ -1173,7 +1179,6 @@ fn MonitorCardNew(
     }
 }
 
-
 #[component]
 fn HitCard(hit: Hit) -> impl IntoView {
     let (accent_color, bg_color) = if hit.source == "log" {
@@ -1185,7 +1190,7 @@ fn HitCard(hit: Hit) -> impl IntoView {
     let match_type = hit.match_type.clone();
     let timestamp = format_timestamp(&hit.timestamp);
     let source = hit.source.clone();
-    
+
     view! {
         <div style=format!("background: white; padding: 1.125rem; border-radius: 10px; border: 1px solid #e5e7eb; border-left: 3px solid {}; transition: all 0.2s; box-shadow: 0 1px 3px rgba(0,0,0,0.05);", accent_color)
              onmouseover=format!("this.style.boxShadow='0 4px 12px rgba(0,0,0,0.1)'; this.style.borderLeftColor='{}'", accent_color)
@@ -1203,14 +1208,14 @@ fn HitCard(hit: Hit) -> impl IntoView {
                     {timestamp}
                 </div>
             </div>
-            
+
             <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.875rem;">
                 <span style="font-size: 0.75rem; color: #6b7280; font-weight: 500;">"Source:"</span>
                 <span style=format!("padding: 0.125rem 0.5rem; background: {}; color: {}; border-radius: 4px; font-size: 0.75rem; font-weight: 600;", bg_color, accent_color)>
                     {source}
                 </span>
             </div>
-            
+
             // Display log line if available
             {if let Some(log_line) = &hit.log_line {
                 view! {
@@ -1224,7 +1229,7 @@ fn HitCard(hit: Hit) -> impl IntoView {
             } else {
                 view! { <></> }.into_any()
             }}
-            
+
             // Display matched indicators
             {if !hit.matched_indicators.is_empty() {
                 view! {
@@ -1244,7 +1249,7 @@ fn HitCard(hit: Hit) -> impl IntoView {
             } else {
                 view! { <></> }.into_any()
             }}
-            
+
             // Display data fields
             <div style="background: #f9fafb; padding: 0.875rem; border-radius: 8px; font-size: 0.8125rem; border: 1px solid #f3f4f6;">
                 {hit.data.iter().map(|data| {
@@ -1294,10 +1299,10 @@ fn format_value(value: &serde_json::Value) -> String {
             if arr.is_empty() {
                 "[]".into()
             } else {
-                format!("[{}]", arr.iter()
-                    .map(format_value)
-                    .collect::<Vec<_>>()
-                    .join(", "))
+                format!(
+                    "[{}]",
+                    arr.iter().map(format_value).collect::<Vec<_>>().join(", ")
+                )
             }
         }
         serde_json::Value::Object(_) => "[Object]".into(),
@@ -1309,13 +1314,13 @@ fn format_timestamp(timestamp: &str) -> String {
     // Parse ISO 8601 timestamp and format as human-readable
     // Example input: "2025-01-22T14:30:45.123Z"
     // Example output: "Jan 22, 14:30:45"
-    
+
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(timestamp) {
         // Format as "Mon DD, HH:MM:SS"
         let local = dt.with_timezone(&chrono::Local);
         return local.format("%b %d, %H:%M:%S").to_string();
     }
-    
+
     // Fallback to just showing time if parsing fails
     if let Some(time_part) = timestamp.split('T').nth(1) {
         if let Some(time_only) = time_part.split('.').next() {
@@ -1326,10 +1331,7 @@ fn format_timestamp(timestamp: &str) -> String {
 }
 
 #[component]
-fn ErrorModal(
-    message: ReadSignal<String>,
-    set_show: WriteSignal<bool>,
-) -> impl IntoView {
+fn ErrorModal(message: ReadSignal<String>, set_show: WriteSignal<bool>) -> impl IntoView {
     view! {
         <div style="position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; z-index: 1000;">
             <div style="background: white; border-radius: 12px; padding: 1.5rem; width: 90%; max-width: 500px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);">
@@ -1350,14 +1352,14 @@ fn ErrorModal(
                         "×"
                     </button>
                 </div>
-                
+
                 <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 1rem; margin-bottom: 1.5rem;">
                     <div style="font-size: 0.75rem; font-weight: 600; color: #991b1b; margin-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.5px;">"Error Details"</div>
                     <div style="font-family: 'SF Mono', 'Monaco', monospace; font-size: 0.8125rem; color: #dc2626; word-break: break-word; line-height: 1.5;">
                         {move || message.get()}
                     </div>
                 </div>
-                
+
                 <div style="display: flex; justify-content: flex-end;">
                     <button
                         on:click=move |_| set_show.set(false)
@@ -1372,4 +1374,3 @@ fn ErrorModal(
         </div>
     }
 }
-

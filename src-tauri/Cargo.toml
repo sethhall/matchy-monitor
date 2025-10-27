@@ -1,5 +1,5 @@
 [package]
-name = "matchy-monitor"
+name = "matchy-monitor-backend"
 version = "0.1.0"
 description = "Monitor Your System With Matchy"
 authors = ["you"]

@@ -40,7 +40,9 @@
       "icons/tray-icon.png"
     ],
     "macOS": {
-      "entitlements": "Entitlements.plist"
+      "entitlements": "Entitlements.plist",
+      "signingIdentity": null,
+      "providerShortName": null
     }
   }
 }

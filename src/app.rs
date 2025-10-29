@@ -91,6 +91,17 @@ struct DatabaseInfo {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct UpdateStatus {
+    checking: bool,
+    available: bool,
+    current_version: Option<String>,
+    latest_version: Option<String>,
+    downloading: bool,
+    progress: f64,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct DatabaseStatsInfo {
     total_queries: u64,
     queries_with_match: u64,
@@ -190,6 +201,16 @@ pub fn App() -> impl IntoView {
         signal(load_collapse_state("databases_expanded", true));
     let (monitors_expanded, set_monitors_expanded) =
         signal(load_collapse_state("monitors_expanded", true));
+    let (update_status, set_update_status) = signal(UpdateStatus {
+        checking: false,
+        available: false,
+        current_version: None,
+        latest_version: None,
+        downloading: false,
+        progress: 0.0,
+        error: None,
+    });
+    let (checking_updates, set_checking_updates) = signal(false);
 
     // Load databases and monitors on mount
     Effect::new(move |_| {
@@ -284,6 +305,34 @@ pub fn App() -> impl IntoView {
         });
     });
 
+    // Listen for automatic database update checks
+    Effect::new(move |_| {
+        spawn_local(async move {
+            let closure = Closure::wrap(Box::new(move |event: JsValue| {
+                log("Received database-update-available event");
+                match js_sys::Reflect::get(&event, &"payload".into()) {
+                    Ok(payload) => {
+                        match serde_wasm_bindgen::from_value::<UpdateStatus>(payload) {
+                            Ok(status) => {
+                                log(&format!("Update available: {:?}", status));
+                                set_update_status.set(status);
+                            }
+                            Err(e) => {
+                                error(&format!("Failed to parse update status: {:?}", e));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error(&format!("Failed to get payload: {:?}", e));
+                    }
+                }
+            }) as Box<dyn FnMut(JsValue)>);
+
+            let _ = listen("database-update-available", closure.as_ref()).await;
+            closure.forget();
+        });
+    });
+
     let add_database = move |_| {
         spawn_local(async move {
             match invoke("pick_file", JsValue::NULL).await {
@@ -341,6 +390,60 @@ pub fn App() -> impl IntoView {
             let args = serde_wasm_bindgen::to_value(&serde_json::json!({"id": id})).unwrap();
             if invoke("unload_database", args).await.is_ok() {
                 set_databases.update(|dbs| dbs.retain(|db| db.id != id));
+            }
+        });
+    };
+
+    let check_for_updates = move |_| {
+        set_checking_updates.set(true);
+        spawn_local(async move {
+            match invoke("check_database_updates", JsValue::NULL).await {
+                Ok(res) => {
+                    if let Ok(status) = serde_wasm_bindgen::from_value::<UpdateStatus>(res) {
+                        set_update_status.set(status);
+                    }
+                }
+                Err(e) => {
+                    let err_msg = e.as_string().unwrap_or_else(|| "Failed to check for updates".to_string());
+                    error(&err_msg);
+                    set_error_message.set(err_msg);
+                    set_show_error_modal.set(true);
+                }
+            }
+            set_checking_updates.set(false);
+        });
+    };
+
+    let download_update = move |_| {
+        set_update_status.update(|status| status.downloading = true);
+        spawn_local(async move {
+            match invoke("download_database_update", JsValue::NULL).await {
+                Ok(_) => {
+                    log("Database updated successfully");
+                    // Reload databases list
+                    if let Ok(res) = invoke("list_databases", JsValue::NULL).await {
+                        if let Ok(dbs) = serde_wasm_bindgen::from_value::<Vec<DatabaseInfo>>(res) {
+                            set_databases.set(dbs);
+                        }
+                    }
+                    // Reset update status
+                    set_update_status.set(UpdateStatus {
+                        checking: false,
+                        available: false,
+                        current_version: None,
+                        latest_version: None,
+                        downloading: false,
+                        progress: 0.0,
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    let err_msg = e.as_string().unwrap_or_else(|| "Failed to download update".to_string());
+                    error(&err_msg);
+                    set_error_message.set(err_msg);
+                    set_show_error_modal.set(true);
+                    set_update_status.update(|status| status.downloading = false);
+                }
             }
         });
     };
@@ -403,6 +506,16 @@ pub fn App() -> impl IntoView {
                                 <span style="background: #3b82f6; color: white; border-radius: 10px; padding: 0.25rem 0.5rem; font-size: 0.875rem; font-weight: 600; min-width: 1.25rem; text-align: center;">
                                     {move || databases.get().len()}
                                 </span>
+                                <button
+                                    on:click=check_for_updates
+                                    disabled=move || checking_updates.get()
+                                    style="background: none; border: none; color: #10b981; cursor: pointer; padding: 0.25rem 0.5rem; font-size: 0.875rem; line-height: 1; transition: all 0.15s; border-radius: 4px; font-weight: 600;"
+                                    onmouseover="this.style.background='#d1fae5'; this.style.color='#059669'"
+                                    onmouseout="this.style.background='none'; this.style.color='#10b981'"
+                                    title="Check for Database Updates"
+                                >
+                                    {move || if checking_updates.get() { "⏳" } else { "🔄" }}
+                                </button>
                                 <button
                                     on:click=add_database
                                     style="background: none; border: none; color: #3b82f6; cursor: pointer; padding: 0.25rem 0.5rem; font-size: 1rem; line-height: 1; transition: all 0.15s; border-radius: 4px; font-weight: 600;"
@@ -507,6 +620,39 @@ pub fn App() -> impl IntoView {
                         }
                     }}
                     </div>
+
+                    // Update notification banner
+                    {move || {
+                        let status = update_status.get();
+                        if status.available {
+                            view! {
+                                <div style="background: linear-gradient(135deg, #10b981, #059669); padding: 0.875rem; border-radius: 8px; box-shadow: 0 2px 8px rgba(16, 185, 129, 0.2);">
+                                    <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
+                                        <span style="font-size: 1.25rem;">"✨"</span>
+                                        <div style="color: white; font-weight: 700; font-size: 0.8125rem;">"Update Available"</div>
+                                    </div>
+                                    <div style="color: rgba(255, 255, 255, 0.9); font-size: 0.6875rem; margin-bottom: 0.75rem; line-height: 1.4;">
+                                        {format!(
+                                            "Version {} → {}",
+                                            status.current_version.as_ref().map(|s| s.as_str()).unwrap_or("none"),
+                                            status.latest_version.as_ref().map(|s| s.as_str()).unwrap_or("unknown")
+                                        )}
+                                    </div>
+                                    <button
+                                        on:click=download_update
+                                        disabled=move || update_status.get().downloading
+                                        style="width: 100%; padding: 0.5rem; background: white; color: #059669; border: none; border-radius: 6px; cursor: pointer; font-size: 0.75rem; font-weight: 600; transition: all 0.2s;"
+                                        onmouseover="this.style.background='rgba(255, 255, 255, 0.9)'"
+                                        onmouseout="this.style.background='white'"
+                                    >
+                                        {move || if update_status.get().downloading { "Downloading..." } else { "Update Now" }}
+                                    </button>
+                                </div>
+                            }.into_any()
+                        } else {
+                            view! { <></> }.into_any()
+                        }
+                    }}
                     </div>
 
                     // Monitors section
